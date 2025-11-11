@@ -4,10 +4,13 @@ import pandas as pd
 from bs4 import BeautifulSoup
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# ESPN site/v2 scoreboard for men's D-I. We’ll request groups=50 (Division I)
+# and paginate through all pages for the date.
 ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
 
 def _espn_school_name(team_obj: dict) -> str:
-    # Prefer school/location (better match to Torvik)
+    # Prefer school/location (best match to Torvik)
     return team_obj.get("location") or team_obj.get("shortDisplayName") or team_obj.get("displayName") or team_obj.get("name")
 
 def _parse_details_to_spreads(details: str, home_name: str, away_name: str):
@@ -27,14 +30,33 @@ def _parse_details_to_spreads(details: str, home_name: str, away_name: str):
         return +num, -num
     return None, None
 
-def _scrape_espn(date: dt.date) -> pd.DataFrame:
+def _fetch_espn_events(date: dt.date):
     datestr = date.strftime("%Y%m%d")
-    r = requests.get(ESPN_URL, params={"dates": datestr}, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    js = r.json()
+    all_events = []
+    page = 1
+    while True:
+        params = {
+            "dates": datestr,
+            "groups": "50",   # Division I
+            "limit": "500",   # be generous
+            "page": str(page)
+        }
+        r = requests.get(ESPN_URL, params=params, headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        js = r.json()
+        events = js.get("events", []) or []
+        all_events.extend(events)
+        # stop when no more events returned (ESPN may not expose pageCount consistently)
+        if not events:
+            break
+        page += 1
+        if page > 10:
+            break
+    return all_events
 
+def _scrape_espn(date: dt.date) -> pd.DataFrame:
     rows = []
-    for ev in js.get("events", []) or []:
+    for ev in _fetch_espn_events(date):
         comps = ev.get("competitions") or []
         if not comps:
             continue
@@ -48,15 +70,15 @@ def _scrape_espn(date: dt.date) -> pd.DataFrame:
         if not home or not away:
             continue
 
-        home_name = _espn_school_name(home.get("team") or {})
-        away_name = _espn_school_name(away.get("team") or {})
+        home_name = _espn_school_name((home.get("team") or {}))
+        away_name = _espn_school_name((away.get("team") or {}))
         if not home_name or not away_name:
             continue
 
-        # Default: no line yet
+        # defaults when no line yet
         spread_home = spread_away = None
 
-        # Try to extract a spread if present
+        # Try to extract a spread if present (several shapes in ESPN JSON)
         for o in comp.get("odds") or []:
             h_odds = o.get("homeTeamOdds") or {}
             a_odds = o.get("awayTeamOdds") or {}
@@ -87,7 +109,7 @@ def _scrape_espn(date: dt.date) -> pd.DataFrame:
                     spread_home, spread_away = h, a
 
             if spread_home is not None and spread_away is not None:
-                # Enforce symmetry
+                # Enforce symmetry just in case
                 if abs(spread_home + spread_away) > 0.1:
                     spread_away = -spread_home
                 break  # got a line for this game
@@ -102,12 +124,12 @@ def _scrape_espn(date: dt.date) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
+# Optional Covers fallback kept for completeness (rarely needed now)
 def _scrape_covers(_date: dt.date) -> pd.DataFrame:
     url = "https://www.covers.com/sport/basketball/ncaab/odds"
     r = requests.get(url, headers=HEADERS, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-
     rows = []
     for game in soup.select("div.covers-CoversMatchupsTable-tableRow, tr"):
         txt = game.get_text(" ", strip=True)
