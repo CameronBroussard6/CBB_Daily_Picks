@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, io, sys, time, textwrap, re
+import os, io, sys, time, re, random
 from datetime import datetime, timezone
 import requests
 import pandas as pd
@@ -10,8 +10,12 @@ EDGE_THRESHOLD    = float(os.getenv("EDGE_THRESHOLD", "2.0"))
 OUTPUT_DIR        = os.getenv("OUTPUT_DIR", "site")
 TORVIK_YEAR       = os.getenv("TORVIK_YEAR", "2025")
 
-TORVIK_URL = f"https://barttorvik.com/trank.php?year={TORVIK_YEAR}&csv=1"
-TR_ODDS_URL = "https://www.teamrankings.com/ncb/odds/"
+TORVIK_URL_BASE   = "https://barttorvik.com/trank.php"
+TR_ODDS_URL       = "https://www.teamrankings.com/ncb/odds/"
+
+# retry tuning (still live-only, just tries again if Torvik sends HTML)
+TORVIK_MAX_RETRIES = int(os.getenv("TORVIK_MAX_RETRIES", "6"))
+TORVIK_SLEEP_BASE  = float(os.getenv("TORVIK_SLEEP_BASE", "2.0"))  # seconds
 
 # ---------------- Utilities ----------------
 def log(msg: str):
@@ -30,12 +34,10 @@ def normalize_name(name: str) -> str:
     s = s.replace("’", "'").replace("‘", "'").replace("´","'")
     s = s.replace(".", "").replace(",", "")
     s = re.sub(r"\s+", " ", s)
-    # common harmonizations seen in your tables
     repl = {
         "st "         : "saint ",
         "st. "        : "saint ",
         "cal st "     : "cal state ",
-        "uc "         : "ucla " if s == "uc" else s,  # no-op except lone "uc"
         "texas a&m cc": "texas a&m corpus christi",
         "texas a&m-corpus christi": "texas a&m corpus christi",
         "long island university": "liu",
@@ -48,7 +50,6 @@ def normalize_name(name: str) -> str:
     for k,v in repl.items():
         if s.startswith(k):
             s = s.replace(k, v, 1)
-    # trim again
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -59,38 +60,66 @@ def pick(df: pd.DataFrame, names):
     raise KeyError(f"Missing expected column among ({', '.join(names)})")
 
 # ---------------- Data Loads (LIVE ONLY) ----------------
-def load_torvik():
-    log(f"[INFO] Loading Torvik CSV from {TORVIK_URL}")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+_UAS = [
+    # rotate a few modern desktop UAs to dodge basic rate limits
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+]
+
+def _torvik_params():
+    # little cache-buster to avoid CDN reuse when rate limit page is cached
+    return {
+        "year": TORVIK_YEAR,
+        "csv": "1",
+        "top": "0",            # include all teams (avoids default cut)
+        "_": str(int(time.time()*1000) + random.randint(0, 99999)),
     }
-    r = requests.get(TORVIK_URL, headers=headers, timeout=25)
-    r.raise_for_status()
-    # Ensure we really got CSV (Torvik sometimes serves HTML if rate-limited)
-    text = r.text
-    if text.lstrip().startswith("<"):
-        raise RuntimeError("Torvik returned HTML instead of CSV (rate limited or format change).")
-    df = pd.read_csv(io.StringIO(text))
-    # Expected cols: Team, AdjO, AdjD (names vary rarely)
-    team = pick(df, ["Team","team","School","school"])
-    adjo = pick(df, ["AdjO","AdjOE","AdjO."])
-    adjd = pick(df, ["AdjD","AdjDE","AdjD."])
-    out = pd.DataFrame({
-        "team_raw": team.astype(str),
-        "AdjO": pd.to_numeric(adjo, errors="coerce"),
-        "AdjD": pd.to_numeric(adjd, errors="coerce"),
-    }).dropna(subset=["AdjO","AdjD"])
-    out["team_key"] = out["team_raw"].map(normalize_name)
-    log(f"[INFO] Loaded Torvik rows: {len(out)}")
-    return out
+
+def load_torvik():
+    session = requests.Session()
+    last_err = None
+    for attempt in range(1, TORVIK_MAX_RETRIES + 1):
+        ua = random.choice(_UAS)
+        params = _torvik_params()
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/csv, text/plain, */*;q=0.8",
+            "Referer": "https://barttorvik.com/",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        url = TORVIK_URL_BASE
+        log(f"[INFO] Loading Torvik CSV (try {attempt}/{TORVIK_MAX_RETRIES}) from {url} params={params}")
+        try:
+            r = session.get(url, params=params, headers=headers, timeout=25)
+            r.raise_for_status()
+            text = r.text
+            # if starts with HTML tag, it's the splash/rate-limit page
+            if text.lstrip().startswith("<"):
+                last_err = RuntimeError("Torvik returned HTML instead of CSV (rate limited or format change).")
+                raise last_err
+            df = pd.read_csv(io.StringIO(text))
+            team = pick(df, ["Team","team","School","school"])
+            adjo = pick(df, ["AdjO","AdjOE","AdjO."])
+            adjd = pick(df, ["AdjD","AdjDE","AdjD."])
+            out = pd.DataFrame({
+                "team_raw": team.astype(str),
+                "AdjO": pd.to_numeric(adjo, errors="coerce"),
+                "AdjD": pd.to_numeric(adjd, errors="coerce"),
+            }).dropna(subset=["AdjO","AdjD"])
+            out["team_key"] = out["team_raw"].map(normalize_name)
+            log(f"[INFO] Loaded Torvik rows: {len(out)}")
+            return out
+        except Exception as e:
+            last_err = e
+            sleep_s = TORVIK_SLEEP_BASE * (1.5 ** (attempt - 1))
+            log(f"[WARN] Torvik fetch failed (attempt {attempt}): {e}. Sleeping {sleep_s:.1f}s")
+            time.sleep(sleep_s)
+    # if we get here, all retries failed (still live-only: we fail the job)
+    raise RuntimeError(f"Unable to load ratings from Torvik after {TORVIK_MAX_RETRIES} attempts: {last_err}")
 
 def parse_tr_spread_cell(cell: str):
-    """
-    TeamRankings 'Spread' cell pattern like 'Duke -12.5' or 'Pick'
-    Returns (fav_team, value_float). Positive value means that listed team is +points? No:
-    We interpret value sign literally from the cell ('Team -12.5' => favorite -12.5).
-    """
     if not isinstance(cell, str):
         return (None, None)
     s = cell.strip()
@@ -105,28 +134,23 @@ def parse_tr_spread_cell(cell: str):
 
 def load_odds_from_teamrankings():
     log(f"[INFO] Loading market spreads from {TR_ODDS_URL}")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-    }
+    headers = {"User-Agent": random.choice(_UAS)}
     r = requests.get(TR_ODDS_URL, headers=headers, timeout=25)
     r.raise_for_status()
-    # Parse all tables and pick the one that has 'Matchup' + 'Spread'
-    tables = pd.read_html(io.StringIO(r.text), flavor="lxml")
+    # Use lxml if available, else fallback to bs4-html5lib path via pandas internally
+    tables = pd.read_html(io.StringIO(r.text), flavor=None)
     odds = None
     for t in tables:
         cols = [c.lower() for c in t.columns.astype(str)]
-        if any("matchup" in c for c in cols) and any("spread" == c or "spread" in c for c in cols):
+        if any("matchup" in c for c in cols) and any("spread" in c for c in cols):
             odds = t
             break
     if odds is None:
         raise RuntimeError("Could not find odds table on TeamRankings page.")
-    # Normalize columns
     odds.columns = [str(c).strip() for c in odds.columns]
     matchup_col = [c for c in odds.columns if "Matchup" in c][0]
     spread_col  = [c for c in odds.columns if c.lower().startswith("spread")][0]
 
-    # Expected "Away at Home" in matchup
     def split_matchup(s: str):
         s = str(s)
         if " at " in s.lower():
@@ -134,7 +158,6 @@ def load_odds_from_teamrankings():
         elif " @ " in s:
             parts = s.split(" @ ")
         else:
-            # Fallback—try first ' ' separator if format changes
             parts = s.split()
             if len(parts) >= 2:
                 return parts[0], " ".join(parts[1:])
@@ -149,22 +172,18 @@ def load_odds_from_teamrankings():
         if not away_raw or not home_raw:
             continue
         fav, val = parse_tr_spread_cell(str(row.get(spread_col, "")).strip())
-        # Build home_spread: market line relative to HOME team (home negative = favored)
         home_spread = None
         if fav is None and val is not None:
-            # pick'em
             home_spread = 0.0
         elif fav is not None and (val is not None):
             fav_key = normalize_name(fav)
             home_key = normalize_name(home_raw)
             away_key = normalize_name(away_raw)
             if fav_key == home_key:
-                home_spread = float(val)  # TeamRankings prints "Home -12.5" -> keep sign (-12.5)
+                home_spread = float(val)
             elif fav_key == away_key:
-                # away is favorite by -x; so home is +x
-                home_spread = -float(val)  # invert (e.g., "Away -3" => home +3)
+                home_spread = -float(val)  # away favored -> home is +val
             else:
-                # If names don't match, infer by sign: negative value => listed team favored; assume that's HOME if names differ.
                 home_spread = float(val)
         if home_spread is None:
             continue
@@ -181,11 +200,6 @@ def load_odds_from_teamrankings():
 
 # ---------------- Model ----------------
 def model_margin(h_AdjO, h_AdjD, a_AdjO, a_AdjD, hcp=HOME_COURT_POINTS):
-    """
-    Simple efficiency differential -> margin (per 100 possessions) + HCA.
-    You were using this earlier; keep identical to preserve behavior.
-    """
-    # (Home offense vs away defense) - (Away offense vs home defense) + HCA
     return (h_AdjO - a_AdjD) - (a_AdjO - h_AdjD) + hcp
 
 # ---------------- Publish ----------------
@@ -220,59 +234,42 @@ def write_index(ok: bool, n_games: int, n_edges: int):
 def main():
     ensure_dir(OUTPUT_DIR)
     log_path = os.path.join(OUTPUT_DIR, "build_log.txt")
-    # tee logs also to file
+
     class Tee:
         def __init__(self, path):
             self.f = open(path, "w", encoding="utf-8")
-        def write(self, s):
-            self.f.write(s); self.f.flush()
+        def write(self, s): self.f.write(s); self.f.flush()
         def close(self): self.f.close()
+
     tee = Tee(log_path)
 
     try:
-        print_fn = print
-        def p(*a, **k):
-            msg = " ".join(str(x) for x in a)
-            print_fn(msg)
-            tee.write(msg + "\n")
-
+        p = lambda *a, **k: (print(*a, **k), tee.write(" ".join(str(x) for x in a) + "\n"))
         p(f"[INFO] Date={datetime.now(timezone.utc).strftime('%Y-%m-%d')} HCA={HOME_COURT_POINTS} Edge={EDGE_THRESHOLD}")
 
         ratings = load_torvik()
         odds    = load_odds_from_teamrankings()
 
-        # merge
         home = ratings.add_prefix("h_")
         away = ratings.add_prefix("a_")
         merged = odds.merge(home, left_on="home_key", right_on="h_team_key") \
                      .merge(away, left_on="away_key", right_on="a_team_key")
 
-        # compute model/edge
         merged["model_home_margin"] = merged.apply(
             lambda r: model_margin(r["h_AdjO"], r["h_AdjD"], r["a_AdjO"], r["a_AdjD"]), axis=1
         )
-        # market home margin (what market expects home to win by)
-        # If home_spread is negative (home favorite), market_home_margin = -home_spread (e.g., -7.5 -> +7.5 for home)
         merged["market_home_margin"] = -merged["home_spread"].astype(float)
         merged["edge_pts"] = merged["model_home_margin"] - merged["market_home_margin"]
 
-        # user-facing columns
         out = merged[[
             "home_raw","away_raw","home_spread",
             "h_AdjO","h_AdjD","a_AdjO","a_AdjD",
             "model_home_margin","market_home_margin","edge_pts"
-        ]].rename(columns={
-            "home_raw":"home",
-            "away_raw":"away",
-        }).copy()
+        ]].rename(columns={"home_raw":"home","away_raw":"away"}).copy()
 
-        # ticket column (exactly as you've been using it)
         out["ticket"] = out.apply(lambda r: f"{r['home']} {r['home_spread']:+.1f}".replace("+0.0","PK").replace("-0.0","PK"), axis=1)
-
-        # ordering: biggest absolute edge first
         out.sort_values("edge_pts", key=lambda s: s.abs(), ascending=False, inplace=True)
 
-        # write outputs
         ensure_dir(OUTPUT_DIR)
         out.to_csv(os.path.join(OUTPUT_DIR, "edges_full.csv"), index=False)
         top = out[out["edge_pts"].abs() >= EDGE_THRESHOLD]
@@ -281,7 +278,6 @@ def main():
         p(f"[INFO] Wrote {len(out)} games; {len(top)} edges >= {EDGE_THRESHOLD}")
         write_index(True, len(out), len(top))
     except Exception as e:
-        # fail closed but still publish index + log
         err = f"[ERROR] {type(e).__name__}: {e}"
         print(err); tee.write(err+"\n")
         write_index(False, 0, 0)
