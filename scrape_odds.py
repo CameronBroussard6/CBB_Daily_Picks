@@ -61,8 +61,21 @@ def _scrape_espn(date: dt.date) -> pd.DataFrame:
         if not home or not away:
             continue
 
-        home_name = (home.get("team") or {}).get("displayName") or (home.get("team") or {}).get("name")
-        away_name = (away.get("team") or {}).get("displayName") or (away.get("team") or {}).get("name")
+        # --- pick school-style names (better for matching Torvik) ---
+        team_home = home.get("team") or {}
+        team_away = away.get("team") or {}
+
+        # ESPN objects often have:
+        #  - location: "Duke"
+        #  - name:     "Blue Devils"   (nickname)
+        #  - displayName: "Duke Blue Devils"
+        #  - shortDisplayName: "Duke"
+        def _espn_school_name(t):
+            return t.get("location") or t.get("shortDisplayName") or t.get("displayName") or t.get("name")
+
+        home_name = _espn_school_name(team_home)
+        away_name = _espn_school_name(team_away)
+
         if not home_name or not away_name:
             continue
 
