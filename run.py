@@ -7,25 +7,21 @@ from ratings_trank import load_trank_team_eff
 from scrape_odds import get_spreads
 from model import compute_edges
 
-# Tunables via env (safe defaults if you don't set env vars)
-HOME_BUMP   = float(os.getenv("HOME_COURT_POINTS", "0.6"))  # home-court points added to model
-EDGE_THRESH = float(os.getenv("EDGE_THRESHOLD", "2.0"))     # pick threshold (pts)
+# Tunables via env
+HOME_BUMP   = float(os.getenv("HOME_COURT_POINTS", "0.6"))   # smaller, more realistic default
+EDGE_THRESH = float(os.getenv("EDGE_THRESHOLD", "2.0"))
 OUTDIR      = os.getenv("OUTPUT_DIR", "site")
 
 TODAY = dt.date.today()
 
 
 def _html_table(df: pd.DataFrame) -> str:
-    """
-    Render an HTML table and highlight only the 'ticket' cell when nonblank.
-    No dependencies on pandas Styler/jinja2.
-    """
+    """Render HTML, highlighting only ticket cells when nonblank."""
     if df.empty:
         return "<p>No games.</p>"
 
     df = df.copy()
 
-    # Format numeric columns (show blanks for NaN)
     num_cols = [
         "home_spread", "away_spread",
         "h_AdjO", "h_AdjD", "a_AdjO", "a_AdjD",
@@ -35,11 +31,10 @@ def _html_table(df: pd.DataFrame) -> str:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:.2f}")
 
-    # Wrap ticket with a span for green pill styling (only when it's a pick)
     if "ticket" in df.columns:
         def wrap_ticket(x):
-            x = "" if pd.isna(x) else str(x)
-            return f'<span class="pick">{x}</span>' if x.strip() else ""
+            s = "" if pd.isna(x) else str(x)
+            return f'<span class="pick">{s}</span>' if s.strip() else ""
         df["ticket"] = df["ticket"].apply(wrap_ticket)
 
     table_html = df.to_html(index=False, escape=False, justify="center")
@@ -75,6 +70,21 @@ Model margin = (Home AdjEM − Away AdjEM) + home bump; compared to market sprea
 </body></html>"""
 
 
+def _normalize_and_dedupe(odds: pd.DataFrame) -> pd.DataFrame:
+    """Trim, lowercase-key, and drop duplicate matchups."""
+    if odds.empty:
+        return odds
+    df = odds.copy()
+    for c in ("home", "away"):
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+    # unique key by normalized matchup
+    df["__key"] = (df["home"] + "|" + df["away"]).str.lower()
+    # keep the first occurrence (typically the primary ESPN line)
+    df = df.drop_duplicates(subset="__key", keep="first").drop(columns="__key")
+    return df
+
+
 def main(date: dt.date):
     print(f"[INFO] Date={date}  HCA={HOME_BUMP}  Edge={EDGE_THRESH}")
 
@@ -82,15 +92,25 @@ def main(date: dt.date):
     trank = load_trank_team_eff(date)
     print(f"[INFO] Loaded Torvik rows: {len(trank)}")
 
-    # 2) Odds (now includes all D-I games; spreads may be NaN for some)
-    odds = get_spreads(date)
+    # 2) Odds (may include many sections/endpoints; dedupe afterward)
+    raw_odds = get_spreads(date)
+    raw_count = len(raw_odds)
+    odds = _normalize_and_dedupe(raw_odds)
     with_spread = int(odds["home_spread"].notna().sum()) if not odds.empty else 0
-    print(f"[INFO] Parsed odds rows (including no-line games): {len(odds)}  | with spreads: {with_spread}")
+    print(f"[INFO] Parsed odds rows: {raw_count} -> after dedupe: {len(odds)}  | with spreads: {with_spread}")
 
-    # 3) Model & edges
+    # 3) Model
     edges = compute_edges(odds, trank, home_bump=HOME_BUMP, edge_thresh=EDGE_THRESH)
+
+    # order: picks first (best edge top-down), then the rest
+    if not edges.empty:
+        edges["edge_numeric"] = pd.to_numeric(edges.get("edge_pts"), errors="coerce")
+        # True first for picks: recommend != PASS
+        edges["__is_pick"] = (edges.get("recommend") != "PASS")
+        edges = edges.sort_values(by=["__is_pick", "edge_numeric"], ascending=[False, False]).drop(columns=["__is_pick", "edge_numeric"])
+
     plays = int((edges["recommend"] != "PASS").sum()) if not edges.empty else 0
-    diag = f"Games: {len(odds)} · with spreads: {with_spread} · modeled rows: {len(edges)} · plays: {plays}."
+    diag = f"Games scraped: {raw_count} · after dedupe: {len(odds)} · modeled rows: {len(edges)} · plays: {plays}."
 
     # 4) Outputs
     os.makedirs(OUTDIR, exist_ok=True)
