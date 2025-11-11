@@ -7,9 +7,9 @@ from ratings_trank import load_trank_team_eff
 from scrape_odds import get_spreads
 from model import compute_edges
 
-# Config from env (you can also set these in the workflow env:)
-HOME_BUMP   = float(os.getenv("HOME_COURT_POINTS", "0.8"))  # smaller default
-EDGE_THRESH = float(os.getenv("EDGE_THRESHOLD", "2.0"))
+# Tunables via env (safe defaults if you don't set env vars)
+HOME_BUMP   = float(os.getenv("HOME_COURT_POINTS", "0.6"))  # home-court points added to model
+EDGE_THRESH = float(os.getenv("EDGE_THRESHOLD", "2.0"))     # pick threshold (pts)
 OUTDIR      = os.getenv("OUTPUT_DIR", "site")
 
 TODAY = dt.date.today()
@@ -17,34 +17,32 @@ TODAY = dt.date.today()
 
 def _html_table(df: pd.DataFrame) -> str:
     """
-    Render a table with only the 'ticket' cell highlighted when nonblank,
-    without using pandas Styler (so no jinja2 dependency).
+    Render an HTML table and highlight only the 'ticket' cell when nonblank.
+    No dependencies on pandas Styler/jinja2.
     """
     if df.empty:
         return "<p>No games.</p>"
 
     df = df.copy()
 
-    # Format numeric columns (if present)
+    # Format numeric columns (show blanks for NaN)
     num_cols = [
-        "h_AdjO","h_AdjD","a_AdjO","a_AdjD",
-        "model_home_margin","market_home_margin","edge_pts",
-        "home_spread","away_spread"
+        "home_spread", "away_spread",
+        "h_AdjO", "h_AdjD", "a_AdjO", "a_AdjD",
+        "model_home_margin", "market_home_margin", "edge_pts"
     ]
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:.2f}")
 
-    # Wrap ticket with a span so we can color only picks
+    # Wrap ticket with a span for green pill styling (only when it's a pick)
     if "ticket" in df.columns:
         def wrap_ticket(x):
             x = "" if pd.isna(x) else str(x)
             return f'<span class="pick">{x}</span>' if x.strip() else ""
         df["ticket"] = df["ticket"].apply(wrap_ticket)
 
-    # Build HTML
     table_html = df.to_html(index=False, escape=False, justify="center")
-    # Add minimal CSS to color .pick spans
     css = """
     <style>
       .pick { background: #d4edda; padding: 2px 6px; border-radius: 6px; display: inline-block; }
@@ -84,13 +82,15 @@ def main(date: dt.date):
     trank = load_trank_team_eff(date)
     print(f"[INFO] Loaded Torvik rows: {len(trank)}")
 
-    # 2) Odds (includes no-line games)
+    # 2) Odds (now includes all D-I games; spreads may be NaN for some)
     odds = get_spreads(date)
-    print(f"[INFO] Parsed odds rows (including no-line games): {len(odds)}")
+    with_spread = int(odds["home_spread"].notna().sum()) if not odds.empty else 0
+    print(f"[INFO] Parsed odds rows (including no-line games): {len(odds)}  | with spreads: {with_spread}")
 
-    # 3) Model
+    # 3) Model & edges
     edges = compute_edges(odds, trank, home_bump=HOME_BUMP, edge_thresh=EDGE_THRESH)
-    diag = f"Parsed {len(odds)} odds rows; produced {len(edges)} modeled rows."
+    plays = int((edges["recommend"] != "PASS").sum()) if not edges.empty else 0
+    diag = f"Games: {len(odds)} · with spreads: {with_spread} · modeled rows: {len(edges)} · plays: {plays}."
 
     # 4) Outputs
     os.makedirs(OUTDIR, exist_ok=True)
