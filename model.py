@@ -3,7 +3,6 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 from unidecode import unidecode
 
-# Common alias normalizations for CBB
 ALIASES = {
     "uc santa barbara": "cal santa barbara",
     "uc riverside": "cal riverside",
@@ -33,100 +32,90 @@ def _clean_name(s: str) -> str:
     if not s:
         return ""
     s = unidecode(s).lower()
-    # remove rankings like "No. 5"
     s = re.sub(r"\bno\.\s*\d+\b", "", s)
-    # drop mascots after " - " or remove nickname by keeping only letters/spaces
     s = s.replace("&", " and ")
-    s = re.sub(r"[^\w\s\(\)\-]", " ", s)   # keep parens/dash for campus hints
+    s = re.sub(r"[^\w\s\(\)\-]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
-    # remove parenthetical qualifiers but keep FL/OH forms normalized later
     s = s.replace("(fl)", "fl").replace("(oh)", "oh")
-
-    # canonical short forms
-    s = s.replace(" st ", " state ")
-    s = s.replace(" univ ", " university ").replace(" univ. ", " university ")
-
-    # collapse
+    s = s.replace(" st ", " state ").replace(" univ ", " university ").replace(" univ. ", " university ")
     s = " ".join(s.split())
+    return ALIASES.get(s, s)
 
-    # apply alias map
-    if s in ALIASES:
-        s = ALIASES[s]
-    return s
-
-def _norm_for_match(s: str) -> str:
-    # stronger normalization for matching
+def _norm(s: str) -> str:
     s = _clean_name(s)
     s = s.replace(" university", "")
     s = s.replace(" the ", " ")
     s = s.replace(" state university", " state")
     s = s.replace(" university of ", " ")
     s = s.replace("-", " ")
-    s = " ".join(s.split())
-    return s
+    return " ".join(s.split())
 
-def _fuzzy_map(names, ref_names, cutoff=80):
-    ref_norm = [_norm_for_match(x) for x in ref_names]
+def _fuzzy_map(names, ref_names, cutoff=78):
+    ref_norm = [_norm(x) for x in ref_names]
     out = {}
     for n in names:
-        n_norm = _norm_for_match(n)
-        result = process.extractOne(
-            n_norm,
-            ref_norm,
-            scorer=fuzz.WRatio,
-            score_cutoff=cutoff,
-        )
+        n_norm = _norm(n)
+        result = process.extractOne(n_norm, ref_norm, scorer=fuzz.WRatio, score_cutoff=cutoff)
         if result:
-            idx = result[2]
-            out[n] = ref_names[idx]
+            out[n] = ref_names[result[2]]
         else:
             out[n] = None
     return out
 
-def compute_edges(odds_df: pd.DataFrame, trank_df: pd.DataFrame, home_bump: float = 1.5, edge_thresh: float = 2.0) -> pd.DataFrame:
+def compute_edges(odds_df: pd.DataFrame, trank_df: pd.DataFrame, home_bump: float = 0.8, edge_thresh: float = 2.0) -> pd.DataFrame:
+    # NOTE: default home_bump lowered to 0.8 (you can override via env/CLI)
     if odds_df.empty:
         return pd.DataFrame()
 
-    # Torvik df: expect columns Team, AdjO, AdjD, AdjEM
     ref_names = trank_df["Team"].astype(str).tolist()
-
-    # Map names
-    home_map = _fuzzy_map(odds_df["home"].astype(str).unique(), ref_names, cutoff=80)
-    away_map = _fuzzy_map(odds_df["away"].astype(str).unique(), ref_names, cutoff=80)
+    home_map = _fuzzy_map(odds_df["home"].astype(str).unique(), ref_names, cutoff=78)
+    away_map = _fuzzy_map(odds_df["away"].astype(str).unique(), ref_names, cutoff=78)
 
     df = odds_df.copy()
     df["home_tr"] = df["home"].map(home_map)
     df["away_tr"] = df["away"].map(away_map)
-    df = df.dropna(subset=["home_tr", "away_tr"])
 
-    if df.empty:
-        # nothing matched; return empty to keep pipeline safe
-        return pd.DataFrame()
-
-    # Join Torvik numbers
+    # Join what we can; keep unmatched rows (they’ll yield PASS/blank)
     df = df.merge(trank_df.add_prefix("h_"), left_on="home_tr", right_on="h_Team", how="left")
     df = df.merge(trank_df.add_prefix("a_"), left_on="away_tr", right_on="a_Team", how="left")
 
-    # Model margins
-    df["model_home_margin"] = (df["h_AdjEM"] - df["a_AdjEM"]) + home_bump
-    df["market_home_margin"] = -df["home_spread"]
-    df["edge_pts"] = df["model_home_margin"] - df["market_home_margin"]
+    # Compute model only where we have both teams and a spread
+    have_model = df["h_AdjEM"].notna() & df["a_AdjEM"].notna() & df["home_spread"].notna()
+    df["model_home_margin"] = pd.NA
+    df.loc[have_model, "model_home_margin"] = (df.loc[have_model, "h_AdjEM"] - df.loc[have_model, "a_AdjEM"]) + float(home_bump)
+
+    df["market_home_margin"] = pd.NA
+    df.loc[df["home_spread"].notna(), "market_home_margin"] = -df.loc[df["home_spread"].notna(), "home_spread"]
+
+    df["edge_pts"] = pd.NA
+    both = df["model_home_margin"].notna() & df["market_home_margin"].notna()
+    df.loc[both, "edge_pts"] = df.loc[both, "model_home_margin"] - df.loc[both, "market_home_margin"]
 
     def rec(row):
+        if pd.isna(row["edge_pts"]):
+            return "PASS", ""
         if row["edge_pts"] >= edge_thresh:
             return "HOME", f"{row['home']} {row['home_spread']:+.1f}"
         if row["edge_pts"] <= -edge_thresh:
             return "AWAY", f"{row['away']} {row['away_spread']:+.1f}"
         return "PASS", ""
 
-    picks_df = pd.DataFrame(df.apply(rec, axis=1).tolist(), columns=["recommend", "ticket"])
-    df = pd.concat([df.reset_index(drop=True), picks_df], axis=1)
+    picks = df.apply(rec, axis=1).tolist()
+    df[["recommend", "ticket"]] = pd.DataFrame(picks, index=df.index)
 
+    # Order: plays first by descending edge, then the rest (original order)
+    df["is_play"] = (df["recommend"] != "PASS").astype(int)
+    df["edge_sort"] = df["edge_pts"].fillna(-1e9)  # NAs go to bottom
+    df = df.sort_values(["is_play", "edge_sort"], ascending=[False, False]).drop(columns=["is_play", "edge_sort"])
+
+    # Final columns
     keep = [
-        "home", "away", "home_spread", "away_spread",
-        "h_Team", "a_Team", "h_AdjO", "h_AdjD", "a_AdjO", "a_AdjD",
-        "model_home_margin", "market_home_margin", "edge_pts",
-        "recommend", "ticket"
+        "home","away","home_spread","away_spread",
+        "h_Team","a_Team","h_AdjO","h_AdjD","a_AdjO","a_AdjD",
+        "model_home_margin","market_home_margin","edge_pts",
+        "recommend","ticket"
     ]
-    return df[keep].sort_values(["recommend", "edge_pts"], ascending=[True, False]).reset_index(drop=True)
+    for c in keep:
+        if c not in df.columns:
+            df[c] = pd.NA
+    return df[keep].reset_index(drop=True)
