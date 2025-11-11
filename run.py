@@ -7,6 +7,7 @@ from ratings_trank import load_trank_team_eff
 from scrape_odds import get_spreads
 from model import compute_edges
 
+# Tunables via env
 HOME_BUMP   = float(os.getenv("HOME_COURT_POINTS", "0.6"))
 EDGE_THRESH = float(os.getenv("EDGE_THRESHOLD", "2.0"))
 OUTDIR      = os.getenv("OUTPUT_DIR", "site")
@@ -18,7 +19,6 @@ def _html_table(df: pd.DataFrame) -> str:
         return "<p>No games.</p>"
     df = df.copy()
 
-    # visible numeric columns (after we drop others below)
     num_cols = [
         "home_spread",
         "h_AdjO","h_AdjD","a_AdjO","a_AdjD",
@@ -64,12 +64,28 @@ h1{{margin:0 0 8px}} .meta{{color:#666;margin:8px 0 16px}}
 
 
 def _normalize_and_dedupe(odds: pd.DataFrame) -> pd.DataFrame:
-    if odds.empty: return odds
+    """Clean team names and dedupe home/away pairs robustly."""
+    if odds is None or odds.empty:
+        return pd.DataFrame(columns=["home","away","home_spread","market_home_margin"])
+
     df = odds.copy()
-    for c in ("home","away"):
-        df[c] = df[c].astype(str).strip()
-    df["__key"] = (df["home"] + "|" + df["away"]).str.lower()
-    df = df.drop_duplicates(subset="__key", keep="first").drop(columns="__key")
+
+    # Make sure columns exist
+    for col in ("home", "away"):
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # robust normalization (works if column is object, category, or numeric/NaN)
+    for c in ("home", "away"):
+        df[c] = df[c].astype(str).str.strip()
+        # Normalize common unicode dashes, double spaces, etc.
+        df[c] = (df[c]
+                 .str.replace(r"[‐-‒–—]", "-", regex=True)
+                 .str.replace(r"\s+", " ", regex=True))
+
+    # build dedupe key; protect against "nan"
+    df["__key"] = (df["home"].str.lower() + "|" + df["away"].str.lower())
+    df = df.drop_duplicates(subset="__key", keep="first").drop(columns="__key", errors="ignore")
     return df
 
 
@@ -80,38 +96,36 @@ def main(date: dt.date):
     print(f"[INFO] Loaded Torvik rows: {len(trank)}")
 
     raw_odds = get_spreads(date)
-    raw_count = len(raw_odds)
+    raw_count = 0 if raw_odds is None else len(raw_odds)
     odds = _normalize_and_dedupe(raw_odds)
-    with_spread = int(odds["home_spread"].notna().sum()) if not odds.empty else 0
+    with_spread = int(odds["home_spread"].notna().sum()) if not odds.empty and "home_spread" in odds.columns else 0
     print(f"[INFO] Parsed odds rows: {raw_count} -> deduped: {len(odds)} | with market spreads: {with_spread}")
 
     edges = compute_edges(odds, trank, home_bump=HOME_BUMP, edge_thresh=EDGE_THRESH)
 
-    # ---- Column prune & order (your request) ----
-    # remove away_spread, team label columns, and recommend; keep others
-    cols_drop = [c for c in ["away_spread","h_Team","a_Team","recommend"] if c in edges.columns]
-    edges = edges.drop(columns=cols_drop, errors="ignore")
+    # ---- Column prune & order (requested) ----
+    drop_cols = [c for c in ["away_spread","h_Team","a_Team","recommend"] if c in edges.columns]
+    edges = edges.drop(columns=drop_cols, errors="ignore")
 
-    # Order columns for readability
-    cols_order = [
+    ordered = [
         "home","away","home_spread",
         "h_AdjO","h_AdjD","a_AdjO","a_AdjD",
         "model_home_margin","market_home_margin","edge_pts","ticket"
     ]
-    edges = edges[[c for c in cols_order if c in edges.columns]]
+    edges = edges[[c for c in ordered if c in edges.columns]]
 
-    # Sort: picks (ticket nonblank) first by edge, then the rest
+    # sort: picks first by edge desc, then others
     if not edges.empty:
-        edges["__is_pick"] = edges["ticket"].fillna("").ne("")
+        edges["__pick"] = edges["ticket"].fillna("").ne("")
         edges["__edge"] = pd.to_numeric(edges["edge_pts"], errors="coerce")
-        edges = edges.sort_values(by=["__is_pick","__edge"], ascending=[False,False]).drop(columns=["__is_pick","__edge"])
+        edges = edges.sort_values(by=["__pick","__edge"], ascending=[False, False]).drop(columns=["__pick","__edge"])
 
     plays = int(edges["ticket"].fillna("").ne("").sum()) if not edges.empty else 0
     diag = f"Games scraped: {raw_count} · after dedupe: {len(odds)} · modeled: {len(edges)} · with market spreads: {with_spread} · picks: {plays}."
 
     os.makedirs(OUTDIR, exist_ok=True)
     csv_name = f"ncaab_edges_{date.isoformat()}.csv"
-    edges.to_csv(os.path.join(OUTDIR, csv_name), index=False)
+    edges.to_csv(os.path.join(OUTDIR, csv_name), index=False, encoding="utf-8")
     with open(os.path.join(OUTDIR, "index.html"), "w", encoding="utf-8") as f:
         f.write(build_page(edges, date, diag, csv_name))
     print("[DONE] HTML & CSV written")
