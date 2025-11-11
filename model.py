@@ -1,121 +1,137 @@
-import re
-import pandas as pd
-from rapidfuzz import fuzz, process
-from unidecode import unidecode
+# model.py
+# Computes model edges from ratings + market spreads.
+# Output schema (one row per lined game):
+# home, away, home_spread, h_AdjO, h_AdjD, a_AdjO, a_AdjD,
+# model_home_margin, market_home_margin, edge_pts, ticket
 
+from typing import Tuple
+import pandas as pd
+import re
+
+# Keep cleaner consistent with scraper
 ALIASES = {
     "uc santa barbara": "cal santa barbara",
     "uc riverside": "cal riverside",
-    "uc irvine": "cal irvine",
-    "uc davis": "cal davis",
-    "uc san diego": "cal san diego",
-    "miami fl": "miami florida",
-    "miami (fl)": "miami florida",
-    "miami oh": "miami ohio",
-    "miami (oh)": "miami ohio",
-    "unlv": "nevada las vegas",
-    "texas a&m": "texas am",
-    "texas a&m corpus christi": "texas am corpus christi",
-    "st bonaventure": "saint bonaventure",
-    "st johns": "saint johns",
-    "st josephs": "saint josephs",
-    "st marys": "saint marys",
-    "st francis pa": "saint francis pa",
-    "st francis ny": "saint francis ny",
-    "loyola md": "loyola maryland",
-    "loyola chi": "loyola chicago",
-    "southern cal": "usc",
-    "cal": "california",
+    "st. john's": "st johns",
+    "saint joseph's": "saint josephs",
+    "saint francis (pa)": "saint francis",
+    "cal state northridge": "cal st. northridge",
+    "csu northridge": "cal st. northridge",
+    "central connecticut state": "central connecticut",
+    "william & mary": "william and mary",
+    "texas a&m-corpus christi": "texas a&m corpus chris",
+    "texas a&m corpus christi": "texas a&m corpus chris",
+    "mount st. mary's": "mount st. mary's",
 }
 
-def _clean_name(s: str) -> str:
-    if not s:
+def _clean(s: str) -> str:
+    if s is None:
         return ""
-    s = unidecode(s).lower()
-    s = re.sub(r"\bno\.\s*\d+\b", "", s)
-    s = s.replace("&", " and ")
-    s = re.sub(r"[^\w\s\(\)\-]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    s = s.replace("(fl)", "fl").replace("(oh)", "oh")
-    s = s.replace(" st ", " state ").replace(" univ ", " university ").replace(" univ. ", " university ")
-    s = " ".join(s.split())
+    s = str(s).strip()
+    s = re.sub(r"[‐–—−]", "-", s)  # dash variants -> "-"
+    s = s.replace("&", "and")
+    s = re.sub(r"[^\w\s\-']", " ", s)  # drop punctuation (keep word chars, dash, apostrophe)
+    s = re.sub(r"\s+", " ", s).strip().lower()
     return ALIASES.get(s, s)
 
-def _norm(s: str) -> str:
-    s = _clean_name(s)
-    s = s.replace(" university", "")
-    s = s.replace(" the ", " ")
-    s = s.replace(" state university", " state")
-    s = s.replace(" university of ", " ")
-    s = s.replace("-", " ")
-    return " ".join(s.split())
+def _pair_key(h: str, a: str) -> str:
+    # Order-independent key (so neutral/flip joins don’t break)
+    h1, a1 = _clean(h), _clean(a)
+    return "|".join(sorted([h1, a1]))
 
-def _fuzzy_map(names, ref_names, cutoff=78):
-    ref_norm = [_norm(x) for x in ref_names]
-    out = {}
-    for n in names:
-        n_norm = _norm(n)
-        result = process.extractOne(n_norm, ref_norm, scorer=fuzz.WRatio, score_cutoff=cutoff)
-        if result:
-            out[n] = ref_names[result[2]]
+def _prep_ratings(ratings: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expect a ratings DF with columns at least:
+      Team, AdjO, AdjD
+    Column names are case-insensitive and will be normalized.
+    """
+    df = ratings.copy()
+    cols = {c.lower(): c for c in df.columns}
+    # Flexible column grabs
+    team_col = cols.get("team") or cols.get("name") or "Team"
+    oj_col   = cols.get("adjo") or cols.get("adj_o") or "AdjO"
+    dj_col   = cols.get("adjd") or cols.get("adj_d") or "AdjD"
+
+    # Standardize names
+    df = df.rename(columns={
+        team_col: "Team",
+        oj_col: "AdjO",
+        dj_col: "AdjD",
+    })
+    df["team_clean"] = df["Team"].map(_clean)
+    # Net efficiency we use for margin calc
+    df["Net"] = df["AdjO"] - df["AdjD"]
+    return df[["Team", "team_clean", "AdjO", "AdjD", "Net"]]
+
+def compute_edges(
+    ratings: pd.DataFrame,
+    odds: pd.DataFrame,
+    hca_points: float = 0.6,
+    edge_threshold: float = 2.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    ratings: DataFrame with Team, AdjO, AdjD (or similar => normalized)
+    odds:    DataFrame from scrape_odds.get_spreads()
+             columns: home, away, home_spread, market_home_margin, likely_non_board
+    Returns: (edges_df, diag_df)
+    """
+    r = _prep_ratings(ratings)
+
+    o = odds.copy()
+    # Clean names + keys
+    o["home_clean"] = o["home"].map(_clean)
+    o["away_clean"] = o["away"].map(_clean)
+    o["__key"] = o.apply(lambda x: _pair_key(x["home"], x["away"]), axis=1)
+
+    # Join ratings for both teams
+    o = o.merge(r.add_prefix("h_"), left_on="home_clean", right_on="h_team_clean", how="left")
+    o = o.merge(r.add_prefix("a_"), left_on="away_clean", right_on="a_team_clean", how="left")
+
+    # Compute model home margin: (h_Net - a_Net) + HCA
+    o["model_home_margin"] = (o["h_Net"] - o["a_Net"]) + hca_points
+
+    # Edge vs market (market_home_margin already = "home by X")
+    # edge_pts is model minus market; positive => model likes home by more
+    o["edge_pts"] = o["model_home_margin"] - o["market_home_margin"]
+
+    # Ticket label (just a quick readable pick, no “recommend” column)
+    # Positive edge => lay with home (home -spread), Negative => take away
+    def _ticket(row):
+        mhm = row["market_home_margin"]
+        if pd.isna(mhm):
+            return ""
+        if row["edge_pts"] >= edge_threshold:
+            # Home side
+            return f'{row["home"]} {mhm:+.1f}'.replace("+-", "-")
+        elif row["edge_pts"] <= -edge_threshold:
+            # Away side: market_home_margin = home by s -> away +s
+            return f'{row["away"]} {(-mhm):+ .1f}'.replace("+ -", "-").replace("  ", " ")
         else:
-            out[n] = None
-    return out
+            return ""  # small edge: no ticket
 
-def compute_edges(odds_df: pd.DataFrame, trank_df: pd.DataFrame, home_bump: float = 0.8, edge_thresh: float = 2.0) -> pd.DataFrame:
-    # NOTE: default home_bump lowered to 0.8 (you can override via env/CLI)
-    if odds_df.empty:
-        return pd.DataFrame()
+    o["ticket"] = o.apply(_ticket, axis=1)
 
-    ref_names = trank_df["Team"].astype(str).tolist()
-    home_map = _fuzzy_map(odds_df["home"].astype(str).unique(), ref_names, cutoff=78)
-    away_map = _fuzzy_map(odds_df["away"].astype(str).unique(), ref_names, cutoff=78)
+    # Final tidy frame – only columns you asked for
+    out = o[[
+        "home", "away", "home_spread",
+        "h_AdjO", "h_AdjD", "a_AdjO", "a_AdjD",
+        "model_home_margin", "market_home_margin",
+        "edge_pts", "ticket"
+    ]].copy()
 
-    df = odds_df.copy()
-    df["home_tr"] = df["home"].map(home_map)
-    df["away_tr"] = df["away"].map(away_map)
+    # Sort by absolute edge descending (lined games first)
+    out["__has_line"] = out["market_home_margin"].notna()
+    out = out.sort_values(["__has_line", "edge_pts"], ascending=[False, False]).drop(columns="__has_line")
 
-    # Join what we can; keep unmatched rows (they’ll yield PASS/blank)
-    df = df.merge(trank_df.add_prefix("h_"), left_on="home_tr", right_on="h_Team", how="left")
-    df = df.merge(trank_df.add_prefix("a_"), left_on="away_tr", right_on="a_Team", how="left")
+    # Diagnostics
+    diag = pd.DataFrame([{
+        "ratings_rows": len(ratings),
+        "odds_rows": len(odds),
+        "joined_rows": len(out),
+        "lined_games": int(out["market_home_margin"].notna().sum()),
+        "edge_ge_thresh": int((out["edge_pts"].abs() >= edge_threshold).sum()),
+        "hca_points": hca_points,
+        "edge_threshold": edge_threshold,
+    }])
 
-    # Compute model only where we have both teams and a spread
-    have_model = df["h_AdjEM"].notna() & df["a_AdjEM"].notna() & df["home_spread"].notna()
-    df["model_home_margin"] = pd.NA
-    df.loc[have_model, "model_home_margin"] = (df.loc[have_model, "h_AdjEM"] - df.loc[have_model, "a_AdjEM"]) + float(home_bump)
-
-    df["market_home_margin"] = pd.NA
-    df.loc[df["home_spread"].notna(), "market_home_margin"] = -df.loc[df["home_spread"].notna(), "home_spread"]
-
-    df["edge_pts"] = pd.NA
-    both = df["model_home_margin"].notna() & df["market_home_margin"].notna()
-    df.loc[both, "edge_pts"] = df.loc[both, "model_home_margin"] - df.loc[both, "market_home_margin"]
-
-    def rec(row):
-        if pd.isna(row["edge_pts"]):
-            return "PASS", ""
-        if row["edge_pts"] >= edge_thresh:
-            return "HOME", f"{row['home']} {row['home_spread']:+.1f}"
-        if row["edge_pts"] <= -edge_thresh:
-            return "AWAY", f"{row['away']} {row['away_spread']:+.1f}"
-        return "PASS", ""
-
-    picks = df.apply(rec, axis=1).tolist()
-    df[["recommend", "ticket"]] = pd.DataFrame(picks, index=df.index)
-
-    # Order: plays first by descending edge, then the rest (original order)
-    df["is_play"] = (df["recommend"] != "PASS").astype(int)
-    df["edge_sort"] = df["edge_pts"].fillna(-1e9)  # NAs go to bottom
-    df = df.sort_values(["is_play", "edge_sort"], ascending=[False, False]).drop(columns=["is_play", "edge_sort"])
-
-    # Final columns
-    keep = [
-        "home","away","home_spread","away_spread",
-        "h_Team","a_Team","h_AdjO","h_AdjD","a_AdjO","a_AdjD",
-        "model_home_margin","market_home_margin","edge_pts",
-        "recommend","ticket"
-    ]
-    for c in keep:
-        if c not in df.columns:
-            df[c] = pd.NA
-    return df[keep].reset_index(drop=True)
+    return out.reset_index(drop=True), diag
