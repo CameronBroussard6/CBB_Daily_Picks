@@ -1,135 +1,117 @@
-#!/usr/bin/env python3
+# run.py
+# Orchestrates: load ratings -> scrape odds -> compute edges -> write outputs.
+# Produces CSV at ./out/cbb_edges_<YYYYMMDD>.csv and prints coverage stats.
+
 import os
+import sys
 import datetime as dt
 import pandas as pd
+import requests
+from io import StringIO
 
-from ratings_trank import load_trank_team_eff
-from scrape_odds import get_spreads
+from scrape_odds import get_spreads  # your updated scraper from earlier
 from model import compute_edges
 
-# Tunables via env
-HOME_BUMP   = float(os.getenv("HOME_COURT_POINTS", "0.6"))
-EDGE_THRESH = float(os.getenv("EDGE_THRESHOLD", "2.0"))
-OUTDIR      = os.getenv("OUTPUT_DIR", "site")
-TODAY       = dt.date.today()
+TODAY = dt.date.today()
 
+HCA_POINTS = float(os.getenv("HCA_POINTS", "0.6"))     # matches your logs
+EDGE_THRESH = float(os.getenv("EDGE_THRESH", "2.0"))   # matches your logs
 
-def _html_table(df: pd.DataFrame) -> str:
-    if df.empty:
-        return "<p>No games.</p>"
-    df = df.copy()
+OUT_DIR = os.getenv("OUT_DIR", "out")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-    num_cols = [
-        "home_spread",
-        "h_AdjO","h_AdjD","a_AdjO","a_AdjD",
-        "model_home_margin","market_home_margin","edge_pts"
-    ]
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+def _log(msg: str):
+    print(f"[INFO] {msg}", flush=True)
 
-    if "ticket" in df.columns:
-        def wrap(x):
-            s = "" if pd.isna(x) else str(x)
-            return f'<span class="pick">{s}</span>' if s.strip() else ""
-        df["ticket"] = df["ticket"].apply(wrap)
-
-    css = """
-    <style>
-      .pick { background:#d4edda; padding:2px 6px; border-radius:6px; display:inline-block }
-      table { border-collapse: collapse; width: 100% }
-      th, td { border: 1px solid #ddd; padding: 8px }
-      tr:nth-child(even) { background: #fafafa }
-    </style>
+def load_torvik(date: dt.date) -> pd.DataFrame:
     """
-    return css + df.to_html(index=False, escape=False, justify="center")
-
-
-def build_page(df: pd.DataFrame, date: dt.date, diag: str, csv_name: str) -> str:
-    return f"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NCAAB Edges – {date}</title>
-<style>
-body{{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:24px;max-width:1100px;margin:auto}}
-h1{{margin:0 0 8px}} .meta{{color:#666;margin:8px 0 16px}}
-</style></head><body>
-<h1>NCAAB model vs spread</h1>
-<div class="meta">{date} · Home bump={HOME_BUMP} · Threshold={EDGE_THRESH} pts</div>
-{_html_table(df)}
-<p class="meta">Diagnostics: {diag}</p>
-<p class="meta"><a href="{csv_name}">Download CSV</a></p>
-<p class="meta">Ratings: Bart Torvik (T-Rank). Spreads: ESPN (fallback Covers). Model margin = (Home AdjEM − Away AdjEM) + home bump; compared to market spread.</p>
-</body></html>"""
-
-
-def _normalize_and_dedupe(odds: pd.DataFrame) -> pd.DataFrame:
-    """Clean team names and dedupe home/away pairs robustly."""
-    if odds is None or odds.empty:
-        return pd.DataFrame(columns=["home","away","home_spread","market_home_margin"])
-
-    df = odds.copy()
-
-    # Make sure columns exist
-    for col in ("home", "away"):
-        if col not in df.columns:
-            df[col] = pd.NA
-
-    # robust normalization (works if column is object, category, or numeric/NaN)
-    for c in ("home", "away"):
-        df[c] = df[c].astype(str).str.strip()
-        # Normalize common unicode dashes, double spaces, etc.
-        df[c] = (df[c]
-                 .str.replace(r"[‐-‒–—]", "-", regex=True)
-                 .str.replace(r"\s+", " ", regex=True))
-
-    # build dedupe key; protect against "nan"
-    df["__key"] = (df["home"].str.lower() + "|" + df["away"].str.lower())
-    df = df.drop_duplicates(subset="__key", keep="first").drop(columns="__key", errors="ignore")
+    Loads current team efficiencies from T-Rank.
+    Fallback-friendly: trims to required columns.
+    """
+    # T-Rank 'Team' / 'AdjO' / 'AdjD' CSV endpoint
+    # (Public page CSV; if this ever changes, swap to your cached file.)
+    url = "https://barttorvik.com/trankteamo.php?year=2025&csv=1"  # adjust year as needed
+    _log(f"Fetching Torvik ratings CSV …")
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    df = pd.read_csv(StringIO(r.text))
+    # Normalize columns we need
+    # Common headers on Torvik CSV: "Team", "AdjO", "AdjD" among many others
+    needed = [c for c in df.columns if c.lower() in ("team","adjo","adj_o","adjd","adj_d")]
+    df = df[needed].copy()
+    _log(f"Loaded Torvik rows: {len(df)}")
     return df
 
+def _normalize_and_dedupe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Safe string cleanup and dedupe (fixes the .strip AttributeError).
+    """
+    out = df.copy()
+    for c in ("home", "away"):
+        # Elementwise .str.* (not scalar .strip)
+        out[c] = out[c].astype(str).str.strip()
+    # Dedupe on unordered pair key to avoid repeats across sources
+    from scrape_odds import _pair_key as _pair  # reuse same key for consistency
+    out["__key"] = out.apply(lambda r: _pair(r["home"], r["away"]), axis=1)
+    # Prefer rows that actually have spreads
+    out["__has"] = out["market_home_margin"].notna()
+    out = (out.sort_values(["__has"], ascending=[False])
+               .drop_duplicates(subset="__key", keep="first"))
+    return out.drop(columns=["__key","__has"])
 
-def main(date: dt.date):
-    print(f"[INFO] Date={date}  HCA={HOME_BUMP}  Edge={EDGE_THRESH}")
+def main(run_date: dt.date):
+    _log(f"Date={run_date}   HCA={HCA_POINTS}   Edge={EDGE_THRESH}")
 
-    trank = load_trank_team_eff(date)
-    print(f"[INFO] Loaded Torvik rows: {len(trank)}")
+    # 1) Ratings
+    ratings = load_torvik(run_date)
 
-    raw_odds = get_spreads(date)
-    raw_count = 0 if raw_odds is None else len(raw_odds)
+    # 2) Odds (multi-source inside)
+    raw_odds = get_spreads(run_date)
+    if raw_odds is None or raw_odds.empty:
+        _log("No odds scraped; aborting with empty output.")
+        print("")  # keep action from choking on no stdout
+        sys.exit(0)
+
+    # 3) Clean + dedupe odds (fix prior .strip bug)
     odds = _normalize_and_dedupe(raw_odds)
-    with_spread = int(odds["home_spread"].notna().sum()) if not odds.empty and "home_spread" in odds.columns else 0
-    print(f"[INFO] Parsed odds rows: {raw_count} -> deduped: {len(odds)} | with market spreads: {with_spread}")
 
-    edges = compute_edges(odds, trank, home_bump=HOME_BUMP, edge_thresh=EDGE_THRESH)
+    raw_count = len(raw_odds)
+    deduped = len(odds)
+    with_spread = int(odds["market_home_margin"].notna().sum())
 
-    # ---- Column prune & order (requested) ----
-    drop_cols = [c for c in ["away_spread","h_Team","a_Team","recommend"] if c in edges.columns]
-    edges = edges.drop(columns=drop_cols, errors="ignore")
+    # 4) Compute model edges
+    edges, diag = compute_edges(
+        ratings=ratings,
+        odds=odds,
+        hca_points=HCA_POINTS,
+        edge_threshold=EDGE_THRESH,
+    )
 
-    ordered = [
+    # 5) Keep only requested columns (already trimmed in model.py, but enforce here too)
+    cols = [
         "home","away","home_spread",
         "h_AdjO","h_AdjD","a_AdjO","a_AdjD",
-        "model_home_margin","market_home_margin","edge_pts","ticket"
+        "model_home_margin","market_home_margin",
+        "edge_pts","ticket",
     ]
-    edges = edges[[c for c in ordered if c in edges.columns]]
+    edges = edges[cols]
 
-    # sort: picks first by edge desc, then others
-    if not edges.empty:
-        edges["__pick"] = edges["ticket"].fillna("").ne("")
-        edges["__edge"] = pd.to_numeric(edges["edge_pts"], errors="coerce")
-        edges = edges.sort_values(by=["__pick","__edge"], ascending=[False, False]).drop(columns=["__pick","__edge"])
+    # 6) Write outputs
+    stamp = run_date.strftime("%Y%m%d")
+    out_csv = os.path.join(OUT_DIR, f"cbb_edges_{stamp}.csv")
+    edges.to_csv(out_csv, index=False)
 
-    plays = int(edges["ticket"].fillna("").ne("").sum()) if not edges.empty else 0
-    diag = f"Games scraped: {raw_count} · after dedupe: {len(odds)} · modeled: {len(edges)} · with market spreads: {with_spread} · picks: {plays}."
+    # 7) Print diagnostics (useful in Actions log)
+    _log(f"Odds scraped (raw): {raw_count}  | deduped: {deduped}  | with spreads: {with_spread}")
+    _log(f"Lined games in output: {int(edges['market_home_margin'].notna().sum())}")
+    _log(f"Edges |>= {EDGE_THRESH:.1f}|: {int((edges['edge_pts'].abs() >= EDGE_THRESH).sum())}")
+    _log(f"Wrote: {out_csv}")
 
-    os.makedirs(OUTDIR, exist_ok=True)
-    csv_name = f"ncaab_edges_{date.isoformat()}.csv"
-    edges.to_csv(os.path.join(OUTDIR, csv_name), index=False, encoding="utf-8")
-    with open(os.path.join(OUTDIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(build_page(edges, date, diag, csv_name))
-    print("[DONE] HTML & CSV written")
-
+    # Also echo a compact preview to stdout (first 10 lined games)
+    preview = edges[edges["market_home_margin"].notna()].head(10)
+    if not preview.empty:
+        _log("Preview (top 10 lined games):")
+        print(preview.to_string(index=False))
 
 if __name__ == "__main__":
     main(TODAY)
