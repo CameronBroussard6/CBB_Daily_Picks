@@ -120,9 +120,103 @@ def _scrape_covers(date: dt.date) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ---------- entry ----------
-def get_spreads(date: dt.date) -> pd.DataFrame:
-    df = _scrape_espn(date)
-    if not df.empty:
+def _parse_details_to_spreads(details: str, home_name: str, away_name: str):
+    # details looks like "Duke -6.5" or "Kansas +2.0"
+    # Return (home_spread, away_spread) if we can parse it, else (None, None)
+    if not details:
+        return None, None
+    parts = details.strip().split()
+    if len(parts) < 2:
+        return None, None
+    fav_name = " ".join(parts[:-1]).strip()
+    try:
+        num = float(parts[-1])
+    except Exception:
+        return None, None
+    # If details says "Fav -6.5", then favorite is laying points
+    if fav_name == home_name:
+        return -num, +num
+    if fav_name == away_name:
+        return +num, -num
+    # Sometimes details uses short names; fall back: if number negative -> first listed team is favorite.
+    # ESPN's competitor order is consistent (home/away), but we guard anyway.
+    if num < 0:
+        # first token is favorite but we don't know which; can't trust
+        return None, None
+    return None, None
+
+def _scrape_espn(date: dt.date) -> pd.DataFrame:
+    datestr = date.strftime("%Y%m%d")
+    r = requests.get(ESPN_URL, params={"dates": datestr}, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    js = r.json()
+
+    rows = []
+    events = js.get("events", []) or []
+    for ev in events:
+        comps = ev.get("competitions") or []
+        if not comps:
+            continue
+        comp = comps[0]
+        teams = comp.get("competitors") or []
+        if len(teams) != 2:
+            continue
+
+        home = next((t for t in teams if t.get("homeAway") == "home"), None)
+        away = next((t for t in teams if t.get("homeAway") == "away"), None)
+        if not home or not away:
+            continue
+        home_name = (home.get("team") or {}).get("displayName") or (home.get("team") or {}).get("name")
+        away_name = (away.get("team") or {}).get("displayName") or (away.get("team") or {}).get("name")
+        if not home_name or not away_name:
+            continue
+
+        # Try multiple shapes of odds payload
+        spread_home = spread_away = None
+        for o in comp.get("odds") or []:
+            # 1) Explicit home/away spreads
+            h_odds = o.get("homeTeamOdds") or {}
+            a_odds = o.get("awayTeamOdds") or {}
+            if "spread" in h_odds and "spread" in a_odds:
+                try:
+                    spread_home = float(h_odds["spread"])
+                    spread_away = float(a_odds["spread"])
+                except Exception:
+                    spread_home = spread_away = None
+
+            # 2) Single numeric "spread" + favorite name
+            if (spread_home is None or spread_away is None):
+                sp = o.get("spread")
+                fav = (o.get("favorite") or {}).get("displayName")
+                if sp is not None and fav:
+                    try:
+                        sp = float(sp)
+                        if fav == home_name:
+                            spread_home, spread_away = -sp, +sp
+                        elif fav == away_name:
+                            spread_home, spread_away = +sp, -sp
+                    except Exception:
+                        pass
+
+            # 3) String "details": "Team -6.5"
+            if (spread_home is None or spread_away is None):
+                details = o.get("details") or ""
+                h, a = _parse_details_to_spreads(details, home_name, away_name)
+                if h is not None and a is not None:
+                    spread_home, spread_away = h, a
+
+            if spread_home is not None and spread_away is not None:
+                rows.append({
+                    "home": home_name,
+                    "away": away_name,
+                    "home_spread": spread_home,
+                    "away_spread": spread_away,
+                    "source": "espn"
+                })
+                break
+
+    return pd.DataFrame(rows)
+
         return df
     cv = _scrape_covers(date)
     return cv
