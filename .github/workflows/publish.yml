@@ -2,32 +2,95 @@ name: Build & Publish NCAAB Edges
 
 on:
   schedule:
-    - cron: "15 */3 * * *"   # every 3 hours; adjust
+    - cron: "15 */3 * * *"   # every 3 hours
   workflow_dispatch:
+
+# Ensure only one publish runs at a time (prevents clobbering)
+concurrency:
+  group: pages-build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pages: write
-      id-token: write
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - run: |
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run scraper + model
+
+      - name: Prepare site dir
+        run: |
+          mkdir -p site
+          # Simple header so the page isn't blank even if scrape fails
+          cat > site/index.html <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>NCAAB Edges</title>
+          <h1>NCAAB Daily Edges</h1>
+          <p>Latest run artifacts below. (Auto-published)</p>
+          <div id="files"></div>
+          <script>
+            fetch('.').then(r => r.text()).then(t => {
+              // Nothing fancy—leave as-is; the runner will list CSVs when copied here
+            });
+          </script>
+          HTML
+
+      - name: Run scraper + model (write to site/)
         env:
           HOME_COURT_POINTS: "0.6"
           EDGE_THRESHOLD: "2.0"
           OUTPUT_DIR: "site"
-        run: python run.py
+        run: |
+          set -o pipefail
+          # Run and capture logs but never leave site/ empty
+          python run.py 2>&1 | tee site/build_log.txt || echo "SCRAPER FAILED" | tee -a site/build_log.txt
+
+          # If CSVs exist, append a simple listing to index.html
+          if ls site/*.csv >/dev/null 2>&1; then
+            {
+              echo "<h2>CSV Outputs</h2><ul>"
+              for f in site/*.csv; do
+                b="$(basename "$f")"
+                echo "<li><a href=\"$b\">$b</a></li>"
+              done
+              echo "</ul>"
+              echo "<p>Updated: $(date -u +"%Y-%m-%d %H:%M UTC")</p>"
+            } >> site/index.html
+          else
+            {
+              echo "<h2>No CSV outputs found</h2>"
+              echo "<p>See build_log.txt for details.</p>"
+              echo "<p>Updated: $(date -u +"%Y-%m-%d %H:%M UTC")</p>"
+            } >> site/index.html
+          fi
+
+      # Required by deploy-pages@v4
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
       - name: Upload Pages artifact
+        # Always attempt to upload so the site updates even if scraping failed
+        if: always()
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
+
       - name: Deploy to GitHub Pages
+        if: always()
         uses: actions/deploy-pages@v4
