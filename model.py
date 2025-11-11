@@ -49,8 +49,9 @@ def compute_edges(odds_df: pd.DataFrame, trank_df: pd.DataFrame, home_bump: floa
         if row["edge_pts"] <= -edge_thresh: 
             return "AWAY", f"{row['away']} {row['away_spread']:+.1f}"
         return "PASS", ""
-    picks = df.apply(rec, axis=1, result_type="expand")
-    df["recommend"], df["ticket"] = picks[0], picks[1]
+    picks = df.apply(rec, axis=1)
+    picks_df = pd.DataFrame(picks.tolist(), columns=["recommend", "ticket"])
+    df = pd.concat([df.reset_index(drop=True), picks_df], axis=1)
 
     keep = ["home","away","home_spread","away_spread",
             "h_Team","a_Team","h_AdjO","h_AdjD","a_AdjO","a_AdjD",
