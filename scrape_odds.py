@@ -113,14 +113,36 @@ def _scrape_espn(date: dt.date) -> pd.DataFrame:
                     spread_home, spread_away = h, a
 
             if spread_home is not None and spread_away is not None:
+                # --- Normalize signs using favorite if available ---
+                fav = (o.get("favorite") or {}).get("displayName")
+                # ESPN also sometimes gives a single numeric 'spread' (absolute)
+                abs_spread = None
+                sp_val = o.get("spread")
+                try:
+                    abs_spread = abs(float(sp_val)) if sp_val is not None else None
+                except Exception:
+                    abs_spread = None
+
+                if fav in (home_name, away_name) and abs_spread is not None:
+                    if fav == home_name:
+                        spread_home, spread_away = -abs_spread, +abs_spread
+                    else:
+                        spread_home, spread_away = +abs_spread, -abs_spread
+
+                # --- Enforce symmetry: home + away ≈ 0 ---
+                if abs((spread_home + spread_away)) > 0.1:
+                    # If we still don't have symmetry, trust the home value and mirror it.
+                    spread_away = -spread_home
+
                 rows.append({
                     "home": home_name,
                     "away": away_name,
-                    "home_spread": spread_home,
-                    "away_spread": spread_away,
+                    "home_spread": float(spread_home),
+                    "away_spread": float(spread_away),
                     "source": "espn"
                 })
-                break  # got spreads for this game
+                break
+
 
     return pd.DataFrame(rows)
 
