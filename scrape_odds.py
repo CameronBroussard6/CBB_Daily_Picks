@@ -5,72 +5,86 @@ from bs4 import BeautifulSoup
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# ---- 1) DraftKings public API (primary) ----
-# NCAAB event group id (college basketball)
-DK_EVENTGROUP = "92453"
-DK_URL = f"https://sportsbook.draftkings.com/sites/US-SB/api/v5/eventgroups/{DK_EVENTGROUP}?format=json"
+# ---------- 1) ESPN public scoreboard (primary) ----------
+# Example: https://site.api.espn.com/apis/v2/sports/basketball/mens-college-basketball/scoreboard?dates=20251111
+ESPN_URL = "https://site.api.espn.com/apis/v2/sports/basketball/mens-college-basketball/scoreboard"
 
-def _scrape_draftkings(date: dt.date) -> pd.DataFrame:
-    r = requests.get(DK_URL, headers=HEADERS, timeout=25)
+def _scrape_espn(date: dt.date) -> pd.DataFrame:
+    datestr = date.strftime("%Y%m%d")
+    r = requests.get(ESPN_URL, params={"dates": datestr}, headers=HEADERS, timeout=25)
     r.raise_for_status()
     js = r.json()
 
-    # Build event lookup (teams, start date)
-    events = {e["eventId"]: e for e in js.get("eventGroup", {}).get("events", []) if "eventId" in e}
-    # Filter to today's games
-    ymd = date.isoformat()
-    event_ids_today = {eid for eid, e in events.items() if e.get("startDate", "")[:10] == ymd}
-
-    # Find "Game Lines" -> "Spread" offers
     rows = []
-    for cat in js.get("eventGroup", {}).get("offerCategories", []):
-        if cat.get("name") != "Game Lines":
+    for ev in js.get("events", []):
+        comps = (ev.get("competitions") or [])
+        if not comps:
             continue
-        for sub in cat.get("offerSubcategoryDescriptors", []):
-            if sub.get("name") != "Game Lines":
-                continue
-            for desc in sub.get("offerSubcategory", {}).get("offers", []):
-                # offers is a list of lists: [[offer_for_event]]
-                if not desc:
-                    continue
-                offer = desc[0]
-                eid = offer.get("eventId")
-                if eid not in event_ids_today:
-                    continue
-                if offer.get("betType") != "Spread":
-                    continue
+        comp = comps[0]
 
-                ev = events[eid]
-                home = ev.get("homeTeamName")
-                away = ev.get("awayTeamName")
-                outcomes = offer.get("outcomes", []) or []
+        # Map teams & home/away
+        teams = comp.get("competitors") or []
+        if len(teams) != 2:
+            continue
 
-                # outcomes typically contain two sides with "label" and "line"
-                line_map = {}
-                for o in outcomes:
-                    label = o.get("label")
-                    line = o.get("line")
-                    # Some DK payloads store tenths as ints (e.g., -75 => -7.5)
-                    if isinstance(line, int):
-                        line = line / 10.0
-                    try:
-                        line = float(line)
-                    except Exception:
-                        continue
-                    line_map[label] = line
+        home = next((t for t in teams if t.get("homeAway") == "home"), None)
+        away = next((t for t in teams if t.get("homeAway") == "away"), None)
+        if not home or not away:
+            continue
 
-                if home in line_map and away in line_map:
-                    rows.append({
-                        "home": home,
-                        "away": away,
-                        "home_spread": line_map[home],
-                        "away_spread": line_map[away],
-                        "source": "draftkings"
-                    })
+        home_name = home.get("team", {}).get("displayName") or home.get("team", {}).get("name")
+        away_name = away.get("team", {}).get("displayName") or away.get("team", {}).get("name")
+        if not home_name or not away_name:
+            continue
+
+        # Odds block: ESPN often includes consensus/primary book
+        odds_list = comp.get("odds") or []
+        if not odds_list:
+            # No spread yet, skip
+            continue
+
+        # Take the first odds entry with a point spread
+        spread_home = None
+        spread_away = None
+        for o in odds_list:
+            # Some payloads have "details": "Team -6.5" and "overUnder", plus "spread" numbers
+            # Prefer explicit spread fields if present
+            sp = o.get("spread")
+            if sp is not None:
+                try:
+                    sp = float(sp)
+                except Exception:
+                    sp = None
+            fav = (o.get("favorite") or {}).get("displayName")
+            # If "spread" present and favorite known, derive home/away spreads
+            if sp is not None and fav:
+                if fav == home_name:
+                    spread_home, spread_away = -sp, sp
+                elif fav == away_name:
+                    spread_home, spread_away = sp, -sp
+            # Some variants expose "homeTeamOdds"/"awayTeamOdds" with "spread"
+            h_odds = o.get("homeTeamOdds") or {}
+            a_odds = o.get("awayTeamOdds") or {}
+            if "spread" in h_odds and "spread" in a_odds:
+                try:
+                    spread_home = float(h_odds["spread"])
+                    spread_away = float(a_odds["spread"])
+                except Exception:
+                    pass
+
+            if spread_home is not None and spread_away is not None:
+                rows.append({
+                    "home": home_name,
+                    "away": away_name,
+                    "home_spread": spread_home,
+                    "away_spread": spread_away,
+                    "source": "espn"
+                })
+                break
 
     return pd.DataFrame(rows)
 
-# ---- 2) Covers fallback (brittle HTML) ----
+# ---------- 2) Covers fallback (HTML, best-effort) ----------
 def _scrape_covers(date: dt.date) -> pd.DataFrame:
     url = "https://www.covers.com/sport/basketball/ncaab/odds"
     r = requests.get(url, headers=HEADERS, timeout=20)
@@ -103,17 +117,10 @@ def _scrape_covers(date: dt.date) -> pd.DataFrame:
                     pass
     return pd.DataFrame(rows)
 
-# ---- 3) VegasInsider (very limited; used as last-resort placeholder) ----
-def _scrape_vegasinsider(date: dt.date) -> pd.DataFrame:
-    return pd.DataFrame()  # keep disabled unless needed; VI markup changes often
-
-# ---- entry point ----
+# ---------- entry ----------
 def get_spreads(date: dt.date) -> pd.DataFrame:
-    dk = _scrape_draftkings(date)
-    if not dk.empty:
-        return dk
+    df = _scrape_espn(date)
+    if not df.empty:
+        return df
     cv = _scrape_covers(date)
-    if not cv.empty:
-        return cv
-    vi = _scrape_vegasinsider(date)
-    return vi
+    return cv
