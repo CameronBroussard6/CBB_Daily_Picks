@@ -21,7 +21,7 @@ jobs:
           pip install -r requirements.txt
       - name: Run scraper + model
         env:
-          HOME_COURT_POINTS: "1.5"
+          HOME_COURT_POINTS: "0.6"
           EDGE_THRESHOLD: "2.0"
           OUTPUT_DIR: "site"
         run: python run.py
