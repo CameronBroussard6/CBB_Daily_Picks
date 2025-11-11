@@ -1,292 +1,293 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Build & Publish NCAAB Edges (resilient)
-- Tries Torvik CSV; falls back to Torvik HTML; then local backup CSV if present.
-- If ratings/odds unavailable, still writes index + build_log and exits 0 (so Pages deploys).
-- Outputs:
-    site/index.html
-    site/edges_full.csv           (when we have ratings+odds)
-    site/edges_top.csv            (|edge| >= EDGE_THRESHOLD)
-    site/build_log.txt
-Env:
-  HOME_COURT_POINTS (default 0.6)
-  EDGE_THRESHOLD    (default 2.0)
-  OUTPUT_DIR        (default "site")
-  TORVIK_URL        (optional) default points at Torvik CSV
-  ODDS_CSV          (optional) local odds fallback
-  TORVIK_BACKUP     (optional) local backup ratings CSV (default data/torvik_backup.csv)
-"""
-
-from __future__ import annotations
-import io, os, re, sys, math, traceback
+import os, io, sys, time, textwrap, re
 from datetime import datetime, timezone
-import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+import pandas as pd
 
-# ------------ Config ------------
-HCA_PTS = float(os.getenv("HOME_COURT_POINTS", "0.6"))
-EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "2.0"))
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "site").strip() or "site"
+# ---------------- CONFIG (env overridable) ----------------
+HOME_COURT_POINTS = float(os.getenv("HOME_COURT_POINTS", "0.6"))
+EDGE_THRESHOLD    = float(os.getenv("EDGE_THRESHOLD", "2.0"))
+OUTPUT_DIR        = os.getenv("OUTPUT_DIR", "site")
+TORVIK_YEAR       = os.getenv("TORVIK_YEAR", "2025")
 
-TORVIK_URL = os.getenv("TORVIK_URL", "https://barttorvik.com/trank.php?year=2025&csv=1")
-ODDS_CSV = os.getenv("ODDS_CSV", "data/odds.csv")
-TORVIK_BACKUP = os.getenv("TORVIK_BACKUP", "data/torvik_backup.csv")
+TORVIK_URL = f"https://barttorvik.com/trank.php?year={TORVIK_YEAR}&csv=1"
+TR_ODDS_URL = "https://www.teamrankings.com/ncb/odds/"
 
-# ------------ Logging ------------
-def ensure_dir(p): os.makedirs(p, exist_ok=True)
-ensure_dir(OUTPUT_DIR)
+# ---------------- Utilities ----------------
+def log(msg: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{ts}] {msg}")
+    sys.stdout.flush()
 
-def log_write(msg):
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    line = f"[{ts}] {msg}"
-    print(line, flush=True)
-    with open(os.path.join(OUTPUT_DIR, "build_log.txt"), "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
 
-def write_index(has_csv: bool, n_games: int, n_edges: int, note: str = ""):
-    ensure_dir(OUTPUT_DIR)
-    path = os.path.join(OUTPUT_DIR, "index.html")
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    if not has_csv:
-        body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>NCAAB Daily Edges</title></head>
-<body style="font-family: Georgia, serif; padding:16px">
-<h1>NCAAB Daily Edges</h1>
-<p>Latest run artifacts below. (Auto-published)</p>
-<h2>No CSV outputs found</h2>
-<p>{note}</p>
-<p>See <a href="build_log.txt">build_log.txt</a> for details.</p>
-<p style="color:#555">Updated: {now}</p>
-</body></html>"""
-    else:
-        body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>NCAAB Daily Edges</title></head>
-<body style="font-family: Georgia, serif; padding:16px">
-<h1>NCAAB Daily Edges</h1>
-<p>Latest run artifacts below. (Auto-published)</p>
-<ul>
-  <li><a href="edges_full.csv">edges_full.csv</a> (games: {n_games})</li>
-  <li><a href="edges_top.csv">edges_top.csv</a> (|edge| ≥ {EDGE_THRESHOLD}: {n_edges})</li>
-  <li><a href="build_log.txt">build_log.txt</a></li>
-</ul>
-<p style="color:#555">Updated: {now}</p>
-</body></html>"""
-    with open(path, "w", encoding="utf-8") as f: f.write(body)
-    log_write(f"[INFO] Wrote {path}")
+def normalize_name(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    s = name.lower().strip()
+    s = re.sub(r"&", "and", s)
+    s = s.replace("’", "'").replace("‘", "'").replace("´","'")
+    s = s.replace(".", "").replace(",", "")
+    s = re.sub(r"\s+", " ", s)
+    # common harmonizations seen in your tables
+    repl = {
+        "st "         : "saint ",
+        "st. "        : "saint ",
+        "cal st "     : "cal state ",
+        "uc "         : "ucla " if s == "uc" else s,  # no-op except lone "uc"
+        "texas a&m cc": "texas a&m corpus christi",
+        "texas a&m-corpus christi": "texas a&m corpus christi",
+        "long island university": "liu",
+        "central connecticut state": "central connecticut",
+        "saint josephs": "saint joseph's",
+        "william and mary": "william & mary",
+        "mount st marys": "mount st. mary's",
+        "ucsb": "uc santa barbara",
+    }
+    for k,v in repl.items():
+        if s.startswith(k):
+            s = s.replace(k, v, 1)
+    # trim again
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-# ------------ Helpers ------------
-NONALNUM = re.compile(r"[^A-Z0-9]+")
-ALIASES = {
-    "OLEMISS": "MISSISSIPPI",
-    "CENTRALCONNECTICUTSTATE": "CENTRALCONNECTICUT",
-    "SAINTJOHNS": "STJOHNS",
-    "SAINTJOSEPHS": "STJOSEPHS",
-    "ILLCHICAGO": "UIC",
-    "LOYOLOMARYMOUNT": "LOYOLAMARYMOUNT",
-    "TEXASAAMCORPUSCHRISTI": "TEXASAAMCORPUSCHRISTI",
-}
-def norm_team(s: str) -> str:
-    if pd.isna(s): return ""
-    s = str(s).replace("St.", "State").replace("&", "and").replace("'", "")
-    return NONALNUM.sub("", s.upper())
-def canonical(name: str) -> str:
-    n = norm_team(name)
-    return ALIASES.get(n, n)
+def pick(df: pd.DataFrame, names):
+    for n in names:
+        if n in df.columns:
+            return df[n]
+    raise KeyError(f"Missing expected column among ({', '.join(names)})")
 
-def pick_col(df: pd.DataFrame, *cands) -> str:
-    for c in cands:
-        if c in df.columns: return c
-    raise KeyError(f"Missing expected column among {cands} (head cols: {list(df.columns[:6])})")
-
-# ------------ Ratings ------------
-def coerce_ratings(df: pd.DataFrame) -> pd.DataFrame:
-    team_col = None
-    for c in ["Team","team","school","School","TEAM"]:
-        if c in df.columns: team_col = c; break
-    if not team_col:
-        # heuristic
-        for c in df.columns:
-            s = df[c].astype(str)
-            if s.str.contains("State|College|University|A&M|St\\.|Saint", case=False, regex=True).any():
-                team_col = c; break
-    if not team_col:
-        raise KeyError(f"Could not find team column in ratings: {df.columns.tolist()[:8]}")
-
-    off = pick_col(df, "AdjO","AdjOE","Adj Off","AdjOff","Adj. Offense")
-    de  = pick_col(df, "AdjD","AdjDE","Adj Def","AdjDef","Adj. Defense")
-
-    out = df[[team_col, off, de]].copy()
-    out.columns = ["Team","AdjO","AdjD"]
-    out["AdjO"] = pd.to_numeric(out["AdjO"], errors="coerce")
-    out["AdjD"] = pd.to_numeric(out["AdjD"], errors="coerce")
-    out["TEAM_KEY"] = out["Team"].map(canonical)
-    out = out.dropna(subset=["AdjO","AdjD","TEAM_KEY"]).reset_index(drop=True)
+# ---------------- Data Loads (LIVE ONLY) ----------------
+def load_torvik():
+    log(f"[INFO] Loading Torvik CSV from {TORVIK_URL}")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    }
+    r = requests.get(TORVIK_URL, headers=headers, timeout=25)
+    r.raise_for_status()
+    # Ensure we really got CSV (Torvik sometimes serves HTML if rate-limited)
+    text = r.text
+    if text.lstrip().startswith("<"):
+        raise RuntimeError("Torvik returned HTML instead of CSV (rate limited or format change).")
+    df = pd.read_csv(io.StringIO(text))
+    # Expected cols: Team, AdjO, AdjD (names vary rarely)
+    team = pick(df, ["Team","team","School","school"])
+    adjo = pick(df, ["AdjO","AdjOE","AdjO."])
+    adjd = pick(df, ["AdjD","AdjDE","AdjD."])
+    out = pd.DataFrame({
+        "team_raw": team.astype(str),
+        "AdjO": pd.to_numeric(adjo, errors="coerce"),
+        "AdjD": pd.to_numeric(adjd, errors="coerce"),
+    }).dropna(subset=["AdjO","AdjD"])
+    out["team_key"] = out["team_raw"].map(normalize_name)
+    log(f"[INFO] Loaded Torvik rows: {len(out)}")
     return out
 
-def load_torvik() -> pd.DataFrame:
-    log_write(f"[INFO] Date={datetime.utcnow().date()} HCA={HCA_PTS:.1f} Edge={EDGE_THRESHOLD:.1f}")
-    log_write(f"[INFO] Loading Torvik from {TORVIK_URL}")
-    text = None
-    try:
-        r = requests.get(TORVIK_URL, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        text = r.text
-    except Exception as e:
-        log_write(f"[WARN] Torvik request failed: {e}")
+def parse_tr_spread_cell(cell: str):
+    """
+    TeamRankings 'Spread' cell pattern like 'Duke -12.5' or 'Pick'
+    Returns (fav_team, value_float). Positive value means that listed team is +points? No:
+    We interpret value sign literally from the cell ('Team -12.5' => favorite -12.5).
+    """
+    if not isinstance(cell, str):
+        return (None, None)
+    s = cell.strip()
+    if not s or s.lower() == "pick":
+        return (None, 0.0)
+    m = re.match(r"^(.*)\s([+-]?\d+(?:\.\d+)?)$", s)
+    if not m:
+        return (None, None)
+    fav = m.group(1).strip()
+    val = float(m.group(2))
+    return (fav, val)
 
-    if text:
-        first = text.splitlines()[0] if text.splitlines() else ""
-        looks_csv = ("," in first) and ("<html" not in text.lower())
-        if looks_csv:
-            try:
-                df = pd.read_csv(io.StringIO(text))
-                log_write(f"[INFO] Loaded Torvik rows (CSV): {len(df)}")
-                return coerce_ratings(df)
-            except Exception as e:
-                log_write(f"[WARN] CSV parse failed; trying HTML: {e}")
+def load_odds_from_teamrankings():
+    log(f"[INFO] Loading market spreads from {TR_ODDS_URL}")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    }
+    r = requests.get(TR_ODDS_URL, headers=headers, timeout=25)
+    r.raise_for_status()
+    # Parse all tables and pick the one that has 'Matchup' + 'Spread'
+    tables = pd.read_html(io.StringIO(r.text), flavor="lxml")
+    odds = None
+    for t in tables:
+        cols = [c.lower() for c in t.columns.astype(str)]
+        if any("matchup" in c for c in cols) and any("spread" == c or "spread" in c for c in cols):
+            odds = t
+            break
+    if odds is None:
+        raise RuntimeError("Could not find odds table on TeamRankings page.")
+    # Normalize columns
+    odds.columns = [str(c).strip() for c in odds.columns]
+    matchup_col = [c for c in odds.columns if "Matchup" in c][0]
+    spread_col  = [c for c in odds.columns if c.lower().startswith("spread")][0]
 
-        # HTML fallback (lxml/html5lib if available)
-        try:
-            flavors = []
-            try: import lxml  # noqa
-            except Exception: pass
-            else: flavors.append("lxml")
-            try: import html5lib  # noqa
-            except Exception: pass
-            else: flavors.append("html5lib")
+    # Expected "Away at Home" in matchup
+    def split_matchup(s: str):
+        s = str(s)
+        if " at " in s.lower():
+            parts = re.split(r"\s+at\s+", s, flags=re.I)
+        elif " @ " in s:
+            parts = s.split(" @ ")
+        else:
+            # Fallback—try first ' ' separator if format changes
+            parts = s.split()
+            if len(parts) >= 2:
+                return parts[0], " ".join(parts[1:])
+            return s, ""
+        away = parts[0].strip()
+        home = parts[1].strip() if len(parts) > 1 else ""
+        return away, home
 
-            tables = pd.read_html(io.StringIO(text), flavor=flavors or None)
-            if tables:
-                dfh = max(tables, key=lambda t: t.shape[0])
-                log_write(f"[INFO] Loaded Torvik rows (HTML): {len(dfh)}")
-                return coerce_ratings(dfh)
+    recs = []
+    for _, row in odds.iterrows():
+        away_raw, home_raw = split_matchup(row.get(matchup_col, ""))
+        if not away_raw or not home_raw:
+            continue
+        fav, val = parse_tr_spread_cell(str(row.get(spread_col, "")).strip())
+        # Build home_spread: market line relative to HOME team (home negative = favored)
+        home_spread = None
+        if fav is None and val is not None:
+            # pick'em
+            home_spread = 0.0
+        elif fav is not None and (val is not None):
+            fav_key = normalize_name(fav)
+            home_key = normalize_name(home_raw)
+            away_key = normalize_name(away_raw)
+            if fav_key == home_key:
+                home_spread = float(val)  # TeamRankings prints "Home -12.5" -> keep sign (-12.5)
+            elif fav_key == away_key:
+                # away is favorite by -x; so home is +x
+                home_spread = -float(val)  # invert (e.g., "Away -3" => home +3)
             else:
-                log_write("[ERROR] No tables found in Torvik HTML.")
-        except Exception as e:
-            log_write(f"[ERROR] HTML parse failed: {e}")
-
-    # Local backup (optional)
-    if TORVIK_BACKUP and os.path.exists(TORVIK_BACKUP):
-        try:
-            dfb = pd.read_csv(TORVIK_BACKUP)
-            log_write(f"[INFO] Loaded Torvik backup: {TORVIK_BACKUP} ({len(dfb)} rows)")
-            return coerce_ratings(dfb)
-        except Exception as e:
-            log_write(f"[WARN] Could not parse backup {TORVIK_BACKUP}: {e}")
-
-    log_write("[ERROR] Ratings unavailable after CSV/HTML/backup.")
-    return pd.DataFrame(columns=["Team","AdjO","AdjD","TEAM_KEY"])
-
-# ------------ Odds ------------
-def coerce_odds(df: pd.DataFrame) -> pd.DataFrame:
-    cols = {c.lower(): c for c in df.columns}
-    home = cols.get("home") or cols.get("home_team") or cols.get("h_team")
-    away = cols.get("away") or cols.get("away_team") or cols.get("a_team")
-    hspr = cols.get("home_spread") or cols.get("spread") or cols.get("h_spread")
-    if not (home and away and hspr):
-        # loose guess
-        def find_like(ks):
-            for c in df.columns:
-                lc = c.lower()
-                if any(k in lc for k in ks): return c
-            return None
-        home = home or find_like(["home"])
-        away = away or find_like(["away"])
-        hspr = hspr or find_like(["spread","line"])
-    if not (home and away and hspr):
-        return pd.DataFrame(columns=["home","away","home_spread","HOME_KEY","AWAY_KEY"])
-
-    out = df[[home,away,hspr]].copy()
-    out.columns = ["home","away","home_spread"]
-    out["home"] = out["home"].astype(str).str.strip()
-    out["away"] = out["away"].astype(str).str.strip()
-    out["home_spread"] = pd.to_numeric(out["home_spread"], errors="coerce")
-    out = out.dropna(subset=["home","away","home_spread"]).reset_index(drop=True)
-    out["HOME_KEY"] = out["home"].map(canonical)
-    out["AWAY_KEY"] = out["away"].map(canonical)
+                # If names don't match, infer by sign: negative value => listed team favored; assume that's HOME if names differ.
+                home_spread = float(val)
+        if home_spread is None:
+            continue
+        recs.append({
+            "home_raw": home_raw,
+            "away_raw": away_raw,
+            "home_spread": float(home_spread),
+            "home_key": normalize_name(home_raw),
+            "away_key": normalize_name(away_raw),
+        })
+    out = pd.DataFrame.from_records(recs)
+    log(f"[INFO] Parsed markets: {len(out)} games")
     return out
 
-def load_odds() -> pd.DataFrame:
-    # 1) local CSV if present
-    if ODDS_CSV and os.path.exists(ODDS_CSV):
-        try:
-            df = pd.read_csv(ODDS_CSV)
-            log_write(f"[INFO] Loaded odds from local CSV: {ODDS_CSV} ({len(df)} rows)")
-            return coerce_odds(df)
-        except Exception as e:
-            log_write(f"[WARN] Local odds parse failed: {e}")
+# ---------------- Model ----------------
+def model_margin(h_AdjO, h_AdjD, a_AdjO, a_AdjD, hcp=HOME_COURT_POINTS):
+    """
+    Simple efficiency differential -> margin (per 100 possessions) + HCA.
+    You were using this earlier; keep identical to preserve behavior.
+    """
+    # (Home offense vs away defense) - (Away offense vs home defense) + HCA
+    return (h_AdjO - a_AdjD) - (a_AdjO - h_AdjD) + hcp
 
-    # 2) best-effort scrape (often JS, likely to be empty—this is optional)
-    try:
-        url = "https://www.vegasinsider.com/college-basketball/odds/spreads/"
-        r = requests.get(url, timeout=20, headers={"User-Agent":"Mozilla/5.0"})
-        if r.ok:
-            soup = BeautifulSoup(r.text, "html.parser")
-            tables = soup.find_all("table")
-            if tables:
-                df = pd.read_html(str(tables[0]))[0]
-                log_write("[INFO] Parsed a spreads table from backup site (best-effort).")
-                return coerce_odds(df)
-    except Exception as e:
-        log_write(f"[WARN] Backup odds scrape failed: {e}")
+# ---------------- Publish ----------------
+def write_index(ok: bool, n_games: int, n_edges: int):
+    ensure_dir(OUTPUT_DIR)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M %Z")
+    if ok:
+        body = f"""
+        <h1>NCAAB Daily Edges</h1>
+        <p>Latest run artifacts below. (Auto-published)</p>
+        <p><b>{n_games}</b> games with lines. <b>{n_edges}</b> edges ≥ {EDGE_THRESHOLD:.1f} pts.</p>
+        <ul>
+          <li><a href="edges_full.csv">edges_full.csv</a></li>
+          <li><a href="edges_top.csv">edges_top.csv</a></li>
+          <li><a href="build_log.txt">build_log.txt</a></li>
+        </ul>
+        <p>Updated: {ts}</p>
+        """
+    else:
+        body = f"""
+        <h1>NCAAB Daily Edges</h1>
+        <p>Latest run artifacts below. (Auto-published)</p>
+        <p><b>No CSV outputs found</b></p>
+        <p>See <a href="build_log.txt">build_log.txt</a> for details.</p>
+        <p>Updated: {ts}</p>
+        """
+    html = "<!doctype html><meta charset='utf-8'><body style='font-family:Georgia,serif;font-size:18px;line-height:1.3'>" + body + "</body>"
+    with open(os.path.join(OUTPUT_DIR, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html)
 
-    log_write("[WARN] No odds available.")
-    return pd.DataFrame(columns=["home","away","home_spread","HOME_KEY","AWAY_KEY"])
-
-# ------------ Model ------------
-def join_and_score(ratings: pd.DataFrame, odds: pd.DataFrame) -> pd.DataFrame:
-    r_home = ratings.add_prefix("h_").rename(columns={"h_TEAM_KEY":"HOME_KEY"})
-    r_away = ratings.add_prefix("a_").rename(columns={"a_TEAM_KEY":"AWAY_KEY"})
-    df = odds.merge(r_home, on="HOME_KEY", how="left").merge(r_away, on="AWAY_KEY", how="left")
-
-    df["model_home_margin"] = (df["h_AdjO"] - df["a_AdjD"]) - (df["a_AdjO"] - df["h_AdjD"]) + HCA_PTS
-    df["market_home_margin"] = -df["home_spread"]
-    df["edge_pts"] = df["model_home_margin"] - df["market_home_margin"]
-    df["ticket"] = df.apply(lambda r: f"{r['home']} {r['home_spread']:+.1f}" if pd.notna(r["home_spread"]) else "", axis=1)
-
-    keep = ["home","away","home_spread","h_AdjO","h_AdjD","a_AdjO","a_AdjD",
-            "model_home_margin","market_home_margin","edge_pts","ticket"]
-    for k in keep:
-        if k not in df.columns: df[k] = pd.NA
-    df = df.sort_values("edge_pts", ascending=False, na_position="last").reset_index(drop=True)
-    return df[keep]
-
-# ------------ Main ------------
+# ---------------- Main ----------------
 def main():
+    ensure_dir(OUTPUT_DIR)
+    log_path = os.path.join(OUTPUT_DIR, "build_log.txt")
+    # tee logs also to file
+    class Tee:
+        def __init__(self, path):
+            self.f = open(path, "w", encoding="utf-8")
+        def write(self, s):
+            self.f.write(s); self.f.flush()
+        def close(self): self.f.close()
+    tee = Tee(log_path)
+
     try:
+        print_fn = print
+        def p(*a, **k):
+            msg = " ".join(str(x) for x in a)
+            print_fn(msg)
+            tee.write(msg + "\n")
+
+        p(f"[INFO] Date={datetime.now(timezone.utc).strftime('%Y-%m-%d')} HCA={HOME_COURT_POINTS} Edge={EDGE_THRESHOLD}")
+
         ratings = load_torvik()
-        odds = load_odds()
+        odds    = load_odds_from_teamrankings()
 
-        if ratings.empty or odds.empty:
-            note = []
-            if ratings.empty: note.append("Ratings unavailable.")
-            if odds.empty:    note.append("Odds unavailable.")
-            note = " ".join(note) if note else "Upstream data unavailable."
-            write_index(False, 0, 0, note=note)
-            # EXIT SUCCESS so Pages step still runs
-            return
+        # merge
+        home = ratings.add_prefix("h_")
+        away = ratings.add_prefix("a_")
+        merged = odds.merge(home, left_on="home_key", right_on="h_team_key") \
+                     .merge(away, left_on="away_key", right_on="a_team_key")
 
-        df = join_and_score(ratings, odds)
+        # compute model/edge
+        merged["model_home_margin"] = merged.apply(
+            lambda r: model_margin(r["h_AdjO"], r["h_AdjD"], r["a_AdjO"], r["a_AdjD"]), axis=1
+        )
+        # market home margin (what market expects home to win by)
+        # If home_spread is negative (home favorite), market_home_margin = -home_spread (e.g., -7.5 -> +7.5 for home)
+        merged["market_home_margin"] = -merged["home_spread"].astype(float)
+        merged["edge_pts"] = merged["model_home_margin"] - merged["market_home_margin"]
+
+        # user-facing columns
+        out = merged[[
+            "home_raw","away_raw","home_spread",
+            "h_AdjO","h_AdjD","a_AdjO","a_AdjD",
+            "model_home_margin","market_home_margin","edge_pts"
+        ]].rename(columns={
+            "home_raw":"home",
+            "away_raw":"away",
+        }).copy()
+
+        # ticket column (exactly as you've been using it)
+        out["ticket"] = out.apply(lambda r: f"{r['home']} {r['home_spread']:+.1f}".replace("+0.0","PK").replace("-0.0","PK"), axis=1)
+
+        # ordering: biggest absolute edge first
+        out.sort_values("edge_pts", key=lambda s: s.abs(), ascending=False, inplace=True)
+
+        # write outputs
         ensure_dir(OUTPUT_DIR)
-        full = os.path.join(OUTPUT_DIR, "edges_full.csv")
-        top  = os.path.join(OUTPUT_DIR, "edges_top.csv")
-        df.to_csv(full, index=False)
-        df[df["edge_pts"].abs() >= EDGE_THRESHOLD].to_csv(top, index=False)
-        n_games = len(df)
-        n_edges = int((df["edge_pts"].abs() >= EDGE_THRESHOLD).sum())
-        log_write(f"[INFO] Wrote {full} ({n_games} rows)")
-        log_write(f"[INFO] Wrote {top} ({n_edges} rows with |edge| >= {EDGE_THRESHOLD})")
-        write_index(True, n_games, n_edges)
+        out.to_csv(os.path.join(OUTPUT_DIR, "edges_full.csv"), index=False)
+        top = out[out["edge_pts"].abs() >= EDGE_THRESHOLD]
+        top.to_csv(os.path.join(OUTPUT_DIR, "edges_top.csv"), index=False)
 
+        p(f"[INFO] Wrote {len(out)} games; {len(top)} edges >= {EDGE_THRESHOLD}")
+        write_index(True, len(out), len(top))
     except Exception as e:
-        log_write(f"[FATAL] {e}")
-        log_write(traceback.format_exc())
-        write_index(False, 0, 0, note="Unexpected error. See build_log.txt.")
-        # EXIT SUCCESS to allow GitHub Pages to deploy the error page
-        return
+        # fail closed but still publish index + log
+        err = f"[ERROR] {type(e).__name__}: {e}"
+        print(err); tee.write(err+"\n")
+        write_index(False, 0, 0)
+        sys.exit(1)
+    finally:
+        tee.close()
 
 if __name__ == "__main__":
     main()
