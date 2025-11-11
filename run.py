@@ -13,8 +13,8 @@ TORVIK_YEAR       = os.getenv("TORVIK_YEAR", "2025")
 TORVIK_URL_BASE   = "https://barttorvik.com/trank.php"
 TR_ODDS_URL       = "https://www.teamrankings.com/ncb/odds/"
 
-# retry tuning (still live-only, just tries again if Torvik sends HTML)
-TORVIK_MAX_RETRIES = int(os.getenv("TORVIK_MAX_RETRIES", "6"))
+# retry tuning (still live-only; no local backups)
+TORVIK_MAX_RETRIES = int(os.getenv("TORVIK_MAX_RETRIES", "2"))
 TORVIK_SLEEP_BASE  = float(os.getenv("TORVIK_SLEEP_BASE", "2.0"))  # seconds
 
 # ---------------- Utilities ----------------
@@ -61,63 +61,101 @@ def pick(df: pd.DataFrame, names):
 
 # ---------------- Data Loads (LIVE ONLY) ----------------
 _UAS = [
-    # rotate a few modern desktop UAs to dodge basic rate limits
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
 ]
 
-def _torvik_params():
-    # little cache-buster to avoid CDN reuse when rate limit page is cached
+def _torvik_params_csv():
+    # cache-buster to dodge CDN reuse of HTML splash
     return {
         "year": TORVIK_YEAR,
         "csv": "1",
-        "top": "0",            # include all teams (avoids default cut)
+        "top": "0",
         "_": str(int(time.time()*1000) + random.randint(0, 99999)),
     }
 
+def _torvik_params_html():
+    # HTML table view (no csv param)
+    return {
+        "year": TORVIK_YEAR,
+        "top": "0",
+        "_": str(int(time.time()*1000) + random.randint(0, 99999)),
+    }
+
+def _torvik_headers():
+    return {
+        "User-Agent": random.choice(_UAS),
+        "Accept": "text/html, text/csv;q=0.9, */*;q=0.8",
+        "Referer": "https://barttorvik.com/",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+def _shape_torvik_df(df: pd.DataFrame) -> pd.DataFrame:
+    # Try a variety of header spellings Torvik uses
+    team = pick(df, ["Team","team","School","school"])
+    adjo = pick(df, ["AdjO","AdjOE","AdjO.","AdjOE."])
+    adjd = pick(df, ["AdjD","AdjDE","AdjD.","AdjDE."])
+    out = pd.DataFrame({
+        "team_raw": team.astype(str),
+        "AdjO": pd.to_numeric(adjo, errors="coerce"),
+        "AdjD": pd.to_numeric(adjd, errors="coerce"),
+    }).dropna(subset=["AdjO","AdjD"])
+    out["team_key"] = out["team_raw"].map(normalize_name)
+    return out
+
+def _try_torvik_html_fallback(session: requests.Session) -> pd.DataFrame:
+    """Pull the HTML page and parse the ratings table with pandas.read_html using bs4 flavor (no lxml)."""
+    url = TORVIK_URL_BASE
+    params = _torvik_params_html()
+    headers = _torvik_headers()
+    log(f"[INFO] Torvik CSV failed; trying HTML table at {url} params={params}")
+    r = session.get(url, params=params, headers=headers, timeout=25)
+    r.raise_for_status()
+    html = r.text
+    # Pandas -> BeautifulSoup parser; avoid lxml requirement
+    tables = pd.read_html(io.StringIO(html), flavor="bs4")
+    # Find the table that contains AdjO and AdjD columns
+    candidate = None
+    for t in tables:
+        cols = [c.lower() for c in t.columns.astype(str)]
+        if any("adjo" in c for c in cols) and any("adjd" in c for c in cols):
+            candidate = t
+            break
+    if candidate is None:
+        raise RuntimeError("Torvik HTML fallback: could not find ratings table (AdjO/AdjD).")
+    shaped = _shape_torvik_df(candidate)
+    log(f"[INFO] Loaded Torvik rows via HTML fallback: {len(shaped)}")
+    return shaped
+
 def load_torvik():
     session = requests.Session()
-    last_err = None
+    last_html_seen = False
     for attempt in range(1, TORVIK_MAX_RETRIES + 1):
-        ua = random.choice(_UAS)
-        params = _torvik_params()
-        headers = {
-            "User-Agent": ua,
-            "Accept": "text/csv, text/plain, */*;q=0.8",
-            "Referer": "https://barttorvik.com/",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
+        params = _torvik_params_csv()
+        headers = _torvik_headers()
         url = TORVIK_URL_BASE
         log(f"[INFO] Loading Torvik CSV (try {attempt}/{TORVIK_MAX_RETRIES}) from {url} params={params}")
         try:
             r = session.get(url, params=params, headers=headers, timeout=25)
             r.raise_for_status()
             text = r.text
-            # if starts with HTML tag, it's the splash/rate-limit page
             if text.lstrip().startswith("<"):
-                last_err = RuntimeError("Torvik returned HTML instead of CSV (rate limited or format change).")
-                raise last_err
+                last_html_seen = True
+                raise RuntimeError("Torvik returned HTML instead of CSV (rate limited).")
             df = pd.read_csv(io.StringIO(text))
-            team = pick(df, ["Team","team","School","school"])
-            adjo = pick(df, ["AdjO","AdjOE","AdjO."])
-            adjd = pick(df, ["AdjD","AdjDE","AdjD."])
-            out = pd.DataFrame({
-                "team_raw": team.astype(str),
-                "AdjO": pd.to_numeric(adjo, errors="coerce"),
-                "AdjD": pd.to_numeric(adjd, errors="coerce"),
-            }).dropna(subset=["AdjO","AdjD"])
-            out["team_key"] = out["team_raw"].map(normalize_name)
+            out = _shape_torvik_df(df)
             log(f"[INFO] Loaded Torvik rows: {len(out)}")
             return out
         except Exception as e:
-            last_err = e
-            sleep_s = TORVIK_SLEEP_BASE * (1.5 ** (attempt - 1))
+            sleep_s = TORVIK_SLEEP_BASE * (1.6 ** (attempt - 1))
             log(f"[WARN] Torvik fetch failed (attempt {attempt}): {e}. Sleeping {sleep_s:.1f}s")
             time.sleep(sleep_s)
-    # if we get here, all retries failed (still live-only: we fail the job)
-    raise RuntimeError(f"Unable to load ratings from Torvik after {TORVIK_MAX_RETRIES} attempts: {last_err}")
+    # CSV path exhausted: try HTML table fallback once
+    if last_html_seen:
+        return _try_torvik_html_fallback(session)
+    raise RuntimeError("Unable to load ratings from Torvik (CSV attempts failed and no HTML seen).")
 
 def parse_tr_spread_cell(cell: str):
     if not isinstance(cell, str):
@@ -137,8 +175,7 @@ def load_odds_from_teamrankings():
     headers = {"User-Agent": random.choice(_UAS)}
     r = requests.get(TR_ODDS_URL, headers=headers, timeout=25)
     r.raise_for_status()
-    # Use lxml if available, else fallback to bs4-html5lib path via pandas internally
-    tables = pd.read_html(io.StringIO(r.text), flavor=None)
+    tables = pd.read_html(io.StringIO(r.text), flavor="bs4")
     odds = None
     for t in tables:
         cols = [c.lower() for c in t.columns.astype(str)]
@@ -182,7 +219,7 @@ def load_odds_from_teamrankings():
             if fav_key == home_key:
                 home_spread = float(val)
             elif fav_key == away_key:
-                home_spread = -float(val)  # away favored -> home is +val
+                home_spread = -float(val)
             else:
                 home_spread = float(val)
         if home_spread is None:
@@ -275,7 +312,7 @@ def main():
         top = out[out["edge_pts"].abs() >= EDGE_THRESHOLD]
         top.to_csv(os.path.join(OUTPUT_DIR, "edges_top.csv"), index=False)
 
-        p(f"[INFO] Wrote {len(out)} games; {len(top)} edges >= {EDGE_THRESHOLD}")
+        p(f("[INFO] Wrote {len(out)} games; {len(top)} edges >= {EDGE_THRESHOLD}"))
         write_index(True, len(out), len(top))
     except Exception as e:
         err = f"[ERROR] {type(e).__name__}: {e}"
