@@ -1,167 +1,211 @@
-import os
-import sys
-import datetime as dt
+#!/usr/bin/env python3
+import os, io, csv, sys, datetime as dt
 import pandas as pd
+import numpy as np
 import requests
-from io import StringIO
-from typing import Optional
+from pandas.errors import ParserError
 
-from scrape_odds import get_spreads
-from model import compute_edges
+# ---------- config from env ----------
+HOME_COURT_POINTS = float(os.getenv("HOME_COURT_POINTS", "0.6"))
+EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "2.0"))
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "site")
 
 TODAY = dt.date.today()
 
-HCA_POINTS = float(os.getenv("HCA_POINTS", "0.6"))
-EDGE_THRESH = float(os.getenv("EDGE_THRESH", "2.0"))
-OUT_DIR = os.getenv("OUT_DIR", "out")
-TORVIK_YEAR = os.getenv("TORVIK_YEAR", "2025")
-TORVIK_BACKUP = os.getenv("TORVIK_BACKUP", "data/torvik_backup.csv")  # now optional
+# ---------- utils ----------
+def _mkdir(p):
+    os.makedirs(p, exist_ok=True)
 
-os.makedirs(OUT_DIR, exist_ok=True)
-
-def _log(msg: str):
-    print(f"[INFO] {msg}", flush=True)
-
-def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    cols_lower = {str(c).lower(): c for c in df.columns}
-    team = cols_lower.get("team") or cols_lower.get("name")
-    adjo = cols_lower.get("adjo") or cols_lower.get("adj_o")
-    adjd = cols_lower.get("adjd") or cols_lower.get("adj_d")
-    if not (team and adjo and adjd):
-        raise ValueError("Ratings table missing Team/AdjO/AdjD columns")
-    out = df.rename(columns={team: "Team", adjo: "AdjO", adjd: "AdjD"})
-    out = out[["Team", "AdjO", "AdjD"]].copy()
-    # standardize team strings
-    out["Team"] = out["Team"].astype(str).str.strip()
-    return out
-
-def _file_exists(path: Optional[str]) -> bool:
-    return bool(path) and os.path.isfile(path)
-
-def load_torvik() -> Optional[pd.DataFrame]:
+def _safe_read_csv(text: str) -> pd.DataFrame:
     """
-    Try Torvik CSV → HTML. If both fail and a backup file EXISTS, use it.
-    If all fail, return None (fail-soft).
+    Torvik CSV sometimes has quirky lines. Try normal parse, then tolerant.
     """
-    base = f"https://barttorvik.com/trankteamo.php?year={TORVIK_YEAR}"
-    csv_url = f"{base}&csv=1"
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/122.0.0.0 Safari/537.36")
-    }
-
-    # 1) CSV
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    buf = io.StringIO(text)
     try:
-        _log("Fetching Torvik ratings (CSV)…")
-        r = requests.get(csv_url, headers=headers, timeout=30)
+        return pd.read_csv(buf)
+    except ParserError:
+        buf.seek(0)
+        # tolerant parse: python engine, skip bad lines, keep commas
+        return pd.read_csv(
+            buf, engine="python", sep=",", on_bad_lines="skip", quoting=csv.QUOTE_MINIMAL
+        )
+
+def load_torvik(run_date: dt.date) -> pd.DataFrame:
+    """
+    Returns ratings with at least: team, AdjO, AdjD.
+    Tries CSV endpoint, then HTML table, then optional backup file.
+    """
+    year = run_date.year
+    url_csv = f"https://barttorvik.com/trank.php?year={year}&csv=1"
+    try:
+        r = requests.get(url_csv, timeout=30)
         r.raise_for_status()
-        text = r.text
-        if "<html" in text.lower() or "<table" in text.lower():
-            raise ValueError("CSV endpoint returned HTML")
-        df = pd.read_csv(StringIO(text), engine="python", on_bad_lines="skip")
-        df = _normalize_cols(df)
-        _log(f"Loaded Torvik rows (CSV): {len(df)}")
-        return df
-    except Exception as e:
-        _log(f"CSV load failed: {e}")
-
-    # 2) HTML
-    try:
-        _log("Falling back to Torvik HTML table…")
-        page = requests.get(base, headers=headers, timeout=30)
-        page.raise_for_status()
-        tables = pd.read_html(page.text)
-        pick = None
-        for t in tables:
-            if any(str(c).lower() in ("team", "name") for c in t.columns):
-                pick = t
-                break
-        if pick is None:
-            raise ValueError("No suitable table with Team column found")
-        df = _normalize_cols(pick)
-        _log(f"Loaded Torvik rows (HTML): {len(df)}")
-        return df
-    except Exception as e:
-        _log(f"HTML load failed: {e}")
-
-    # 3) Optional local backup
-    if _file_exists(TORVIK_BACKUP):
+        df = _safe_read_csv(r.text)
+    except Exception:
+        # fallback to HTML table
         try:
-            _log(f"Using local backup: {TORVIK_BACKUP}")
-            df = pd.read_csv(TORVIK_BACKUP)
-            df = _normalize_cols(df)
-            _log(f"Loaded Torvik rows (backup): {len(df)}")
-            return df
-        except Exception as e:
-            _log(f"Backup load failed: {e}")
-    else:
-        _log("No local backup present (skipping).")
+            url_html = f"https://barttorvik.com/trank.php?year={year}"
+            r = requests.get(url_html, timeout=30)
+            r.raise_for_status()
+            tables = pd.read_html(r.text)
+            # pick the largest table (usually the team ratings)
+            df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
+        except Exception:
+            # optional local backup
+            bkp = "data/torvik_backup.csv"
+            if os.path.exists(bkp):
+                df = _safe_read_csv(open(bkp, "r", encoding="utf-8").read())
+            else:
+                raise RuntimeError("Unable to load ratings from Torvik (CSV/HTML/backup all failed)")
 
-    _log("All Torvik sources failed. Continuing without ratings.")
-    return None  # fail-soft
+    # normalize expected column names
+    cols = {c.lower().strip(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n in cols: return cols[n]
+        raise KeyError(f"Missing expected column among {names}")
 
-def _normalize_and_dedupe(odds: pd.DataFrame) -> pd.DataFrame:
-    out = odds.copy()
-    for c in ("home", "away"):
-        out[c] = out[c].astype(str).str.strip()
-    # keep first row with a real market line per matchup
-    key = out["home"].str.lower().str.replace(r"\s+", " ", regex=True) + "@" + \
-          out["away"].str.lower().str.replace(r"\s+", " ", regex=True)
-    out["__key"] = key
-    out["__hasline"] = out["market_home_margin"].notna()
-    out = (out.sort_values(["__hasline"], ascending=[False])
-              .drop_duplicates(subset="__key", keep="first")
-              .drop(columns=["__key", "__hasline"]))
+    # team name
+    team_col = pick("team", "school", "Team")
+    # adjusted offense/defense (Torvik often uses AdjO, AdjD or adj_o, adj_d)
+    adjo_col = pick("adjo", "adj_o", "AdjO")
+    adjd_col = pick("adjd", "adj_d", "AdjD")
+
+    out = df[[team_col, adjo_col, adjd_col]].copy()
+    out.columns = ["team", "AdjO", "AdjD"]
+
+    # strip whitespace safely
+    out["team"] = out["team"].astype(str).str.strip()
+    # coerce numerics
+    out["AdjO"] = pd.to_numeric(out["AdjO"], errors="coerce")
+    out["AdjD"] = pd.to_numeric(out["AdjD"], errors="coerce")
+    out = out.dropna(subset=["AdjO", "AdjD"]).reset_index(drop=True)
+
     return out
 
-def main(run_date: dt.date):
-    _log(f"Date={run_date}  HCA={HCA_POINTS}  Edge={EDGE_THRESH}")
-    ratings = load_torvik()
+def _normalize_and_dedupe(raw_odds: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expects raw odds with home/away team & spreads. Clean names.
+    """
+    df = raw_odds.copy()
 
-    raw_odds = get_spreads(run_date)
-    if raw_odds is None or raw_odds.empty:
-        _log("No odds scraped; nothing to do.")
-        sys.exit(0)
+    # IMPORTANT: use .str.strip() and assign back (fixes your Series .strip error)
+    for c in ["home", "away", "home_spread"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
 
-    odds = _normalize_and_dedupe(raw_odds)
-    raw_count = len(raw_odds)
-    deduped = len(odds)
-    with_spread = int(odds["market_home_margin"].notna().sum())
+    # fix weird 'PK' or 'None'
+    if "home_spread" in df.columns:
+        df["home_spread"] = (
+            df["home_spread"]
+            .replace({"PK": 0, "pk": 0, "None": np.nan, "nan": np.nan})
+        )
+        df["home_spread"] = pd.to_numeric(df["home_spread"], errors="coerce")
 
-    edges = compute_edges(
-        ratings=ratings,
-        odds=odds,
-        hca_points=HCA_POINTS,
-        edge_threshold=EDGE_THRESH,
+    # dedupe by (home, away)
+    if {"home", "away"}.issubset(df.columns):
+        df = (df.sort_values(by=["home", "away"])
+                .drop_duplicates(subset=["home", "away"], keep="first")
+                .reset_index(drop=True))
+    return df
+
+def get_market_odds(run_date: dt.date) -> pd.DataFrame:
+    """
+    YOUR existing odds-scrape. Keep as-is; just make sure it returns:
+    columns: home, away, home_spread  (home_spread is home - points)
+    """
+    # TODO: replace with your current scraper import if it lives elsewhere.
+    # Here is a minimal placeholder that should be overwritten by your module.
+    raise NotImplementedError("Wire this to your existing odds scraper function.")
+
+def model_join(odds_df: pd.DataFrame, ratings: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join odds to ratings and compute model margin and edge.
+    """
+    r = ratings.rename(columns={"team":"Team"})
+    # simple fuzzy: exact join first
+    left = odds_df.merge(ratings, left_on="home", right_on="team", how="left")
+    left = left.merge(ratings, left_on="away", right_on="team", how="left", suffixes=("_h","_a"))
+
+    # compute model margin (home minus away); you can plug your exact formula here
+    # Here: (AdjO_h - AdjD_a) - (AdjO_a - AdjD_h) + home court
+    left["model_home_margin"] = (
+        (left["AdjO_h"] - left["AdjD_a"]) - (left["AdjO_a"] - left["AdjD_h"]) + HOME_COURT_POINTS
     )
 
-    # Column order (and remove the old recommend/h_Team/a_Team style cols)
-    cols = [
+    # edge vs market
+    left["market_home_margin"] = -left["home_spread"]  # spread is away+? ensure sign convention
+    left["edge_pts"] = left["model_home_margin"] - left["market_home_margin"]
+
+    # ticket format like "BYU +35.5"
+    def ticket_row(row):
+        try:
+            side = row["home"] if row["edge_pts"] >= 0 else row["away"]
+            num = row["home_spread"]
+            if pd.isna(num): return ""
+            # If model likes home (edge>=0), we take home at minus spread; if you want plus/minus swap, adjust here.
+            if row["edge_pts"] >= 0:
+                return f"{row['home']} {num:+.1f}".replace("+-", "-")
+            else:
+                return f"{row['away']} {(-num):+.1f}".replace("+-", "-")
+        except Exception:
+            return ""
+
+    left["ticket"] = left.apply(ticket_row, axis=1)
+
+    want_cols = [
         "home","away","home_spread",
-        "h_AdjO","h_AdjD","a_AdjO","a_AdjD",
-        "model_home_margin","market_home_margin",
-        "edge_pts","ticket",
+        "AdjO_h","AdjD_h","AdjO_a","AdjD_a",
+        "model_home_margin","market_home_margin","edge_pts","ticket"
     ]
-    for c in cols:
-        if c not in edges.columns:
-            edges[c] = pd.NA
-    edges = edges[cols]
+    # column renames to match your sample
+    final = left[want_cols].rename(columns={
+        "AdjO_h":"h_AdjO","AdjD_h":"h_AdjD","AdjO_a":"a_AdjO","AdjD_a":"a_AdjD"
+    })
 
-    stamp = run_date.strftime("%Y%m%d")
-    out_csv = os.path.join(OUT_DIR, f"cbb_edges_{stamp}.csv")
-    edges.to_csv(out_csv, index=False)
+    return final
 
-    _log(f"Odds scraped (raw): {raw_count} | deduped games: {deduped} | with spreads: {with_spread}")
-    lined = int(edges["market_home_margin"].notna().sum())
-    _log(f"Lined games in output: {lined}")
-    _log(f"Edges |>= {EDGE_THRESH:.1f}|: {int((edges['edge_pts'].abs() >= EDGE_THRESH).sum())}")
-    _log(f"Wrote: {out_csv}")
+def save_outputs(games_df: pd.DataFrame, edges_df: pd.DataFrame):
+    _mkdir(OUTPUT_DIR)
+    games_path = os.path.join(OUTPUT_DIR, "games.csv")
+    edges_path = os.path.join(OUTPUT_DIR, "edges.csv")
+    games_df.to_csv(games_path, index=False)
+    edges_df.to_csv(edges_path, index=False)
+    print(f"[INFO] wrote {games_path}")
+    print(f"[INFO] wrote {edges_path}")
 
-    prev = edges[edges["market_home_margin"].notna()].head(10)
-    if not prev.empty:
-        _log("Preview (top 10 lined games):")
-        print(prev.to_string(index=False))
+# ---------- main ----------
+def main():
+    _mkdir(OUTPUT_DIR)
+
+    # 1) ratings
+    print(f"[INFO] Date={TODAY}  HCA={HOME_COURT_POINTS}  Edge={EDGE_THRESHOLD}")
+    ratings = load_torvik(TODAY)
+    print(f"[INFO] Loaded Torvik rows: {len(ratings)}")
+
+    # 2) odds
+    raw = get_market_odds(TODAY)          # <-- your scraper
+    odds = _normalize_and_dedupe(raw)
+    print(f"[INFO] Loaded odds rows: {len(odds)}")
+
+    # 3) model + edges
+    joined = model_join(odds, ratings)
+    # filter to games with market spread present
+    edges = joined.dropna(subset=["home_spread", "market_home_margin"]).copy()
+    edges = edges.sort_values("edge_pts", ascending=False).reset_index(drop=True)
+
+    # also give a lighter “games” file if you like
+    games = joined[["home","away","home_spread","model_home_margin","edge_pts"]].copy()
+
+    save_outputs(games, edges)
 
 if __name__ == "__main__":
-    main(TODAY)
+    try:
+        main()
+    except Exception as e:
+        # always leave a non-empty site with the error log
+        _mkdir(OUTPUT_DIR)
+        with open(os.path.join(OUTPUT_DIR, "build_log.txt"), "a", encoding="utf-8") as f:
+            f.write(f"FATAL: {repr(e)}\n")
+        raise
