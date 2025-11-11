@@ -7,7 +7,9 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ---------- 1) ESPN public scoreboard (primary) ----------
 # Example: https://site.api.espn.com/apis/v2/sports/basketball/mens-college-basketball/scoreboard?dates=20251111
-ESPN_URL = "https://site.api.espn.com/apis/v2/sports/basketball/mens-college-basketball/scoreboard"
+# correct ESPN scoreboard endpoint
+ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
+
 
 def _scrape_espn(date: dt.date) -> pd.DataFrame:
     datestr = date.strftime("%Y%m%d")
